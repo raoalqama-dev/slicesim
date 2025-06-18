@@ -1,0 +1,43 @@
+# Every traffic model sharing one 20 MHz cell. Run it with:
+#   slicesim run scenarios/basic.yaml
+name: basic
+description: four traffic types sharing a 20 MHz cell
+seed: 1
+duration_s: 10
+
+carrier:
+  bandwidth_mhz: 20   # 51 PRBs at 30 kHz (TS 38.101-1 Table 5.3.2-1)
+  scs_khz: 30         # numerology 1, 0.5 ms slots
+
+link:
+  model: fixed
+  bits_per_prb: 500   # about 51 Mbit/s with every PRB in use
+
+ues:
+  - name: video
+    count: 8
+    traffic:
+      model: on_off
+      mean_on_ms: 2000
+      mean_off_ms: 1000
+      frame_rate_fps: 30
+      frame_bytes: 12500  # 3 Mbit/s while on, 2 Mbit/s on average
+
+  - name: control
+    count: 10
+    traffic:
+      model: periodic
+      period_ms: 10
+      packet_bytes: 100
+
+  - name: sensors
+    count: 50
+    traffic:
+      model: poisson
+      rate_pps: 2
+      packet_bytes: 200
+
+  - name: bulk
+    count: 2
+    traffic:
+      model: full_buffer
