@@ -1,8 +1,8 @@
 """Scenario files: pydantic models and YAML loading.
 
-A scenario describes one simulation completely: the carrier, how much each
-resource block carries, the UEs and their traffic, how long to run and the
-seed. Unknown keys are rejected, so a misspelt option fails loudly instead of
+A scenario describes one simulation completely: the carrier, the cell and
+its radio channel, the link model, the UEs and their traffic, how long to run
+and the seed. Unknown keys are rejected, so a misspelt option fails loudly instead of
 being ignored.
 """
 
@@ -17,6 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 from pydantic_core import ErrorDetails
 
 from slicesim.carrier import Carrier
+from slicesim.channel.link import DEFAULT_OVERHEAD
+from slicesim.channel.pathloss import UMA_MAX_UE_HEIGHT_M, UMA_MIN_DISTANCE_M
 
 
 class _Model(BaseModel):
@@ -38,11 +40,55 @@ class CarrierConfig(_Model):
         return Carrier.create(self.bandwidth_mhz, self.scs_khz)
 
 
+class CellConfig(_Model):
+    """The cell's geometry and link budget (TR 38.901 UMa)."""
+
+    radius_m: float = Field(default=300.0, gt=0, le=5000)
+    min_distance_m: float = Field(
+        default=UMA_MIN_DISTANCE_M, ge=10, description="closest a UE is dropped to the gNB"
+    )
+    ue_height_m: float = Field(default=1.5, ge=1.5, le=UMA_MAX_UE_HEIGHT_M)
+    frequency_ghz: float = Field(default=3.5, ge=0.5, le=100)
+    tx_power_dbm: float = Field(default=46.0, ge=0, le=60, description="total, over the carrier")
+    antenna_gain_db: float = Field(default=0.0, ge=-10, le=40, description="gNB plus UE")
+    noise_figure_db: float = Field(default=7.0, ge=0, le=20)
+    interference_margin_db: float = Field(
+        default=3.0, ge=0, le=30, description="noise rise standing in for other cells"
+    )
+
+    @model_validator(mode="after")
+    def _check_area(self) -> CellConfig:
+        if self.radius_m <= self.min_distance_m:
+            raise ValueError("radius_m must be larger than min_distance_m")
+        return self
+
+
+class ChannelConfig(_Model):
+    """Shadowing and small-scale fading on top of the path loss."""
+
+    shadowing: bool = True
+    fading: Literal["rayleigh", "none"] = "rayleigh"
+    coherence_ms: float = Field(default=40.0, gt=0, le=10_000)
+
+
+class AdaptiveLink(_Model):
+    """CQI-based link adaptation with decoding errors and HARQ."""
+
+    model: Literal["adaptive"] = "adaptive"
+    overhead: float = Field(default=DEFAULT_OVERHEAD, ge=0, lt=1)
+    cqi_delay_slots: int = Field(default=2, ge=0, le=1000)
+    harq_rtt_slots: int = Field(default=8, ge=1, le=64)
+    max_transmissions: int = Field(default=4, ge=1, le=16)
+
+
 class FixedLink(_Model):
-    """Every resource block carries the same number of bits, whoever it serves."""
+    """Every resource block carries the same number of bits and never fails."""
 
     model: Literal["fixed"] = "fixed"
     bits_per_prb: int = Field(default=500, gt=0)
+
+
+LinkConfig = Annotated[AdaptiveLink | FixedLink, Field(discriminator="model")]
 
 
 class FullBufferTraffic(_Model):
@@ -99,7 +145,9 @@ class Scenario(_Model):
     seed: int = Field(ge=0, lt=2**63)
     duration_s: float = Field(gt=0, le=3600)
     carrier: CarrierConfig
-    link: FixedLink = FixedLink()
+    cell: CellConfig = CellConfig()
+    channel: ChannelConfig = ChannelConfig()
+    link: LinkConfig = AdaptiveLink()
     ues: list[UEGroup] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -141,10 +189,15 @@ class ScenarioError(Exception):
         super().__init__(f"{source}: invalid scenario\n{detail}")
 
 
-_TRAFFIC_MODELS = frozenset(
-    get_args(m.model_fields["model"].annotation)[0]
-    for m in (FullBufferTraffic, PoissonTraffic, PeriodicTraffic, OnOffTraffic)
-)
+def _tags(*models: type[BaseModel]) -> frozenset[str]:
+    return frozenset(get_args(m.model_fields["model"].annotation)[0] for m in models)
+
+
+# The tags of each discriminated union, keyed by the field holding it.
+_UNION_TAGS = {
+    "traffic": _tags(FullBufferTraffic, PoissonTraffic, PeriodicTraffic, OnOffTraffic),
+    "link": _tags(AdaptiveLink, FixedLink),
+}
 
 
 def _location(loc: tuple[int | str, ...]) -> str:
@@ -157,7 +210,7 @@ def _location(loc: tuple[int | str, ...]) -> str:
     for i, item in enumerate(loc):
         if isinstance(item, int):
             parts.append(f"[{item}]")
-        elif i > 0 and loc[i - 1] == "traffic" and item in _TRAFFIC_MODELS:
+        elif i > 0 and item in _UNION_TAGS.get(str(loc[i - 1]), ()):
             continue
         else:
             parts.append(f".{item}" if parts else item)

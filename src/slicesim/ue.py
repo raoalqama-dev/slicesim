@@ -13,12 +13,12 @@ import numpy.typing as npt
 class PacketBuffer:
     """First-in, first-out queue of the packets waiting for one UE.
 
-    Packets are served in arrival order and may be split across slots: a
-    packet counts as delivered, and its delay is recorded, in the slot that
-    carries its last byte.
+    Packets are served in arrival order and may be split across transport
+    blocks. Each packet has a sequence number, its position in the UE's
+    stream counting from 0, so the blocks carrying it can be traced.
     """
 
-    __slots__ = ("_arrivals", "_head_sent", "_sizes", "backlog_bytes")
+    __slots__ = ("_arrivals", "_head_sent", "_sizes", "backlog_bytes", "head_seq")
 
     def __init__(self) -> None:
         self._arrivals: deque[float] = deque()
@@ -26,6 +26,8 @@ class PacketBuffer:
         self._head_sent = 0
         self.backlog_bytes = 0
         """Bytes still to send, the partly sent head packet included."""
+        self.head_seq = 0
+        """Sequence number of the packet at the head of the queue."""
 
     def __len__(self) -> int:
         return len(self._sizes)
@@ -41,12 +43,17 @@ class PacketBuffer:
             self._sizes.append(size)
             self.backlog_bytes += size
 
-    def serve(self, nbytes: int, now: float, delays: list[float]) -> int:
-        """Send up to ``nbytes`` from the head of the queue, delivering at ``now``.
+    @property
+    def head_started(self) -> bool:
+        """Whether part of the head packet has already been sent."""
+        return self._head_sent > 0
 
-        Appends the delay of every packet completed to ``delays`` and returns
-        the bytes actually sent, which is less than ``nbytes`` only when the
-        queue runs dry.
+    def serve(self, nbytes: int, completed: list[float]) -> int:
+        """Send up to ``nbytes`` from the head of the queue.
+
+        Appends the arrival time of every packet whose last byte was sent to
+        ``completed`` and returns the bytes actually sent, which is less than
+        ``nbytes`` only when the queue runs dry.
         """
         sent = 0
         while nbytes > 0 and self._sizes:
@@ -58,8 +65,9 @@ class PacketBuffer:
             nbytes -= left
             sent += left
             self._sizes.popleft()
-            delays.append(now - self._arrivals.popleft())
+            completed.append(self._arrivals.popleft())
             self._head_sent = 0
+            self.head_seq += 1
         self.backlog_bytes -= sent
         return sent
 
@@ -102,11 +110,11 @@ class UEPopulation:
         buffer.push(arrival_times, sizes)
         self.backlog_bytes[ue] += buffer.backlog_bytes - before
 
-    def serve(self, ue: int, nbytes: int, now: float, delays: list[float]) -> int:
-        """Send up to ``nbytes`` to a UE at ``now``; see PacketBuffer.serve."""
+    def serve(self, ue: int, nbytes: int, completed: list[float]) -> int:
+        """Send up to ``nbytes`` to a UE; see PacketBuffer.serve."""
         buffer = self.buffers[ue]
         if buffer is None:
             return nbytes
-        sent = buffer.serve(nbytes, now, delays)
+        sent = buffer.serve(nbytes, completed)
         self.backlog_bytes[ue] -= sent
         return sent

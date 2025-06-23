@@ -39,34 +39,64 @@ def test_run_prints_a_summary_table(small: Path) -> None:
     assert "  seed      7" in lines
     assert "  duration  0.2 s (400 slots)" in lines
     assert "  carrier   20 MHz at 30 kHz (numerology 1): 51 PRBs, 0.5 ms slots" in lines
-    assert "  link      fixed, 500 bits per PRB (cell capacity 51.0 Mbit/s)" in lines
+    assert "  link      fixed, 500 bits per PRB, no decoding errors" in lines
+    assert any(line.startswith("  result    ") and "of 51.0 peak" in line for line in lines)
     header = next(line for line in lines if line.startswith("group"))
     assert header.split() == [
         "group",
         "UEs",
         "traffic",
         "offered",
-        "Mb/s",
         "delivered",
-        "Mb/s",
         "per",
         "UE",
-        "Mb/s",
+        "SINR",
+        "CQI",
         "packets",
+        "lost",
         "delay",
-        "mean",
-        "ms",
         "p50",
         "p95",
         "p99",
         "queued",
-        "kB",
     ]
-    rows = {line.split()[0]: line.split() for line in lines[lines.index(header) + 2 :]}
+    table = lines[lines.index(header) + 2 : lines.index(header) + 6]
+    rows = {line.split()[0]: line.split() for line in table}
     assert set(rows) == {"web", "ctrl", "video", "bulk"}
     assert rows["web"][1:3] == ["4", "poisson"]
+    # The fixed link has no SINR or CQI; full-buffer UEs have no packets.
+    assert rows["web"][6:8] == ["-", "-"]
     assert rows["bulk"][3] == "-"
     assert rows["bulk"][-1] == "-"
+    assert lines[-1].startswith("Throughput in Mbit/s;")
+
+
+def test_run_over_the_radio_channel(tmp_path: Path) -> None:
+    path = tmp_path / "radio.yaml"
+    data = scenario_data(duration_s=0.2, link={"model": "adaptive"})
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    code, out, _ = run("run", str(path))
+    assert code == 0
+    lines = out.splitlines()
+    assert (
+        "  cell      UMa at 3.5 GHz, 300 m radius, 46 dBm, shadowing, Rayleigh fading "
+        "(40 ms coherence)"
+    ) in lines
+    assert (
+        "  link      CQI-adaptive at 10% BLER, 14% overhead, CQI 2 slots old, HARQ every 8 "
+        "slots up to 4 transmissions"
+    ) in lines
+    result = next(line for line in lines if line.startswith("  result"))
+    assert "BLER" in result
+    assert "of blocks dropped" in result
+    web = next(line for line in lines if line.startswith("web")).split()
+    assert float(web[6]) > 0  # mean SINR
+    assert 0 < float(web[7]) <= 15  # mean CQI
+
+    data["channel"] = {"shadowing": False, "fading": "none"}
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    _, out, _ = run("run", str(path))
+    assert "no shadowing, no fading" in out
 
 
 def test_run_is_reproducible(small: Path) -> None:
@@ -183,7 +213,6 @@ def test_render_summary_without_a_description_or_deliveries() -> None:
     )
     text = render_summary(simulate(s).summary(), s)
     assert text.splitlines()[0] == "test"
-    row = text.splitlines()[-1].split()
-    assert row[0] == "rare"
+    row = next(line for line in text.splitlines() if line.startswith("rare")).split()
     # Nothing was delivered yet, so there are no delay statistics.
-    assert row[7:11] == ["-", "-", "-", "-"]
+    assert row[10:14] == ["-", "-", "-", "-"]

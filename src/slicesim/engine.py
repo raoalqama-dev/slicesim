@@ -1,21 +1,35 @@
 """The slot loop and its random number streams.
 
-Each slot the scheduler sees the queues as they stand at the start of the
-slot, the cell sends what it allocated, and the packets that arrive during
-the slot join the queues, to be served from the next slot on. A packet's
-delay runs from its arrival to the end of the slot that carries its last
-byte.
+Each slot:
+
+1. every UE's SINR is read from the channel, and the scheduler sizes its
+   transport blocks from the CQI each UE reported ``cqi_delay_slots`` ago;
+2. HARQ retransmissions that are due take their PRBs first;
+3. the remaining PRBs are shared among the UEs with data waiting, as the
+   queues stand at the start of the slot;
+4. each block decodes or fails with the BLER at the SINR it actually meets;
+5. packets of decoded blocks are released to the UE in order;
+6. the packets that arrive during the slot join the queues, to be served
+   from the next slot on.
+
+A packet's delay runs from its arrival to the end of the slot in which it is
+released. With the fixed link every block decodes and steps 1, 2 and 4 drop
+out.
 """
 
 from __future__ import annotations
 
 import zlib
+from collections import deque
 from itertools import pairwise
 
 import numpy as np
 import numpy.typing as npt
 
-from slicesim.config import Scenario
+from slicesim.channel.cell import GroupStreams, RadioChannel
+from slicesim.channel.link import bits_per_prb, bler, cqi_from_sinr
+from slicesim.config import AdaptiveLink, Scenario
+from slicesim.harq import BlockState, DeliveryQueue, Harq, TransportBlock
 from slicesim.metrics import MetricsCollector, SimulationResult
 from slicesim.traffic import Arrivals, TrafficSource, build_source
 from slicesim.ue import UEPopulation
@@ -24,8 +38,8 @@ from slicesim.ue import UEPopulation
 class RngStreams:
     """Independent random generators derived from one scenario seed.
 
-    A stream is named by what it drives (``"traffic"``, later ``"fading"`` and
-    so on) plus optional keys, and is derived from the seed and that name
+    A stream is named by what it drives (``"traffic"``, ``"fading"`` and so
+    on) plus optional keys, and is derived from the seed and that name
     alone, never from the order streams are created in. Changing one model's
     use of randomness, or adding a stream, leaves every other stream's
     sequence unchanged.
@@ -85,8 +99,37 @@ class Simulation:
         )
         counts = np.array([group.count for group in scenario.ues])
         self._group_start = (np.cumsum(counts) - counts).tolist()
-        self.bits_per_prb = np.full(self.ues.size, scenario.link.bits_per_prb, dtype=np.int64)
         self.metrics = MetricsCollector(self.ues.size, self.n_slots)
+        self.delivery = [None if b is None else DeliveryQueue() for b in self.ues.buffers]
+
+        link = scenario.link
+        self.channel: RadioChannel | None = None
+        self.harq: Harq | None = None
+        self._fixed_bits = np.zeros(self.ues.size, dtype=np.int64)
+        if isinstance(link, AdaptiveLink):
+            self.channel = RadioChannel(
+                self.carrier,
+                scenario.cell,
+                scenario.channel,
+                [
+                    (
+                        group.count,
+                        GroupStreams(
+                            drop=streams.generator("ue_drop", group.name),
+                            los=streams.generator("los", group.name),
+                            shadowing=streams.generator("shadowing", group.name),
+                            fading=streams.generator("fading", group.name),
+                        ),
+                    )
+                    for group in scenario.ues
+                ],
+            )
+            self.harq = Harq(link.harq_rtt_slots, link.max_transmissions)
+        else:
+            self._fixed_bits[:] = link.bits_per_prb
+        cqi_delay = link.cqi_delay_slots if isinstance(link, AdaptiveLink) else 0
+        self._sinr_history: deque[npt.NDArray[np.float64]] = deque(maxlen=cqi_delay + 1)
+        self._decoding = streams.generator("harq")
 
     @property
     def finished(self) -> bool:
@@ -109,54 +152,183 @@ class Simulation:
         self.step(self.n_slots - self.slot)
         return self.result()
 
+    def in_flight_bytes(self) -> npt.NDArray[np.int64]:
+        """Bytes in blocks waiting for a retransmission, per UE."""
+        waiting = np.zeros(self.ues.size, dtype=np.int64)
+        if self.harq is not None:
+            for block in self.harq.waiting():
+                waiting[block.ue] += block.nbytes
+        return waiting
+
     def result(self) -> SimulationResult:
         """What the run has recorded so far."""
-        delay_ue, delay_s = self.metrics.delays()
+        m = self.metrics
+        delay_ue, delay_s = m.delays()
+        channel = self.channel
         return SimulationResult(
             scenario=self.scenario,
             carrier=self.carrier,
             n_slots=self.slot,
             ue_group=self.ues.group,
             full_buffer=self.ues.full_buffer,
-            offered_bytes=self.metrics.offered_bytes.copy(),
-            delivered_bytes=self.metrics.delivered_bytes.copy(),
-            packets_arrived=self.metrics.packets_arrived.copy(),
-            packets_delivered=self.metrics.packets_delivered.copy(),
+            offered_bytes=m.offered_bytes.copy(),
+            delivered_bytes=m.delivered_bytes.copy(),
+            packets_arrived=m.packets_arrived.copy(),
+            packets_delivered=m.packets_delivered.copy(),
+            packets_lost=m.packets_lost.copy(),
             backlog_bytes=self.ues.backlog_bytes.copy(),
+            in_flight_bytes=self.in_flight_bytes(),
+            dropped_bytes=m.dropped_bytes.copy(),
+            blocks_sent=m.blocks_sent.copy(),
+            blocks_failed=m.blocks_failed.copy(),
+            retransmissions=m.retransmissions.copy(),
+            blocks_dropped=m.blocks_dropped.copy(),
             delay_ue=delay_ue,
             delay_s=delay_s,
-            prb_used=self.metrics.prb_used[: self.slot].copy(),
+            prb_used=m.prb_used[: self.slot].copy(),
+            distance_m=None if channel is None else channel.distance_m,
+            los=None if channel is None else channel.los.copy(),
+            mean_sinr_db=None if channel is None else channel.mean_sinr_db.copy(),
+            mean_cqi=None if channel is None else m.cqi_sum / max(self.slot, 1),
         )
 
-    def _run_slot(self) -> None:
-        slot_s = self.carrier.slot_duration_s
-        t0 = self.slot * slot_s
-        t1 = (self.slot + 1) * slot_s
-        n_prb = self.carrier.n_prb
+    def _link_state(
+        self,
+    ) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.float64] | None, npt.NDArray[np.intp] | None]:
+        """Bits per PRB for each UE this slot, with the SINR and reported CQI behind them."""
+        if self.channel is None:
+            return self._fixed_bits, None, None
+        link = self.scenario.link
+        assert isinstance(link, AdaptiveLink)
+        sinr = self.channel.sinr_db(self.slot)
+        # The scheduler only knows the CQI the UE reported cqi_delay_slots ago.
+        self._sinr_history.append(sinr)
+        cqi = cqi_from_sinr(self._sinr_history[0])
+        self.metrics.cqi_sum += cqi
+        return bits_per_prb(cqi, link.overhead), sinr, cqi
 
-        # Schedule on the queues as they stand at the start of the slot.
-        need = -(-self.ues.backlog_bytes * 8 // self.bits_per_prb)
-        need[self.ues.full_buffer] = n_prb
-        prbs = share_prbs(np.minimum(need, n_prb), n_prb, self.slot)
-        capacity = prbs * self.bits_per_prb // 8
+    def _retransmit(
+        self,
+        harq: Harq,
+        sinr: npt.NDArray[np.float64],
+        delivered: npt.NDArray[np.int64],
+        resolved: set[int],
+    ) -> int:
+        """Send the retransmissions due this slot; returns the PRBs they used.
+
+        They always fit: the blocks due now are exactly those that failed one
+        round trip ago, and those were all sent within that slot's PRBs.
+        """
+        m = self.metrics
+        sending = harq.due(self.slot)
+        used = sum(block.prbs for block in sending)
+        if used > self.carrier.n_prb:
+            raise RuntimeError(f"retransmissions need {used} PRBs, more than the carrier has")
+        draws = self._decoding.random(len(sending)).tolist()
+        for block, draw in zip(sending, draws, strict=True):
+            harq.transmit(block, self.slot, float(sinr[block.ue]), draw)
+            m.retransmissions[block.ue] += 1
+            if block.state is BlockState.PENDING:
+                continue
+            if block.state is BlockState.DECODED:
+                delivered[block.ue] += block.nbytes
+            else:
+                m.blocks_dropped[block.ue] += 1
+                m.dropped_bytes[block.ue] += block.nbytes
+            resolved.add(block.ue)
+        return used
+
+    def _run_slot(self) -> None:
+        slot = self.slot
+        slot_s = self.carrier.slot_duration_s
+        t0 = slot * slot_s
+        t1 = (slot + 1) * slot_s
+        m = self.metrics
+        bits, sinr, cqi = self._link_state()
 
         delivered = np.zeros(self.ues.size, dtype=np.int64)
         delay_ue: list[int] = []
         delays: list[float] = []
-        for i in np.flatnonzero(prbs).tolist():
-            before = len(delays)
-            delivered[i] = self.ues.serve(i, int(capacity[i]), t1, delays)
-            delay_ue.extend([i] * (len(delays) - before))
-        self.metrics.record_slot(self.slot, prbs, delivered)
-        self.metrics.record_delays(
-            np.asarray(delay_ue, dtype=np.intp), np.asarray(delays, dtype=np.float64)
-        )
+        resolved: set[int] = set()
+
+        retx_prbs = 0
+        if self.harq is not None and sinr is not None and len(self.harq):
+            retx_prbs = self._retransmit(self.harq, sinr, delivered, resolved)
+        free = self.carrier.n_prb - retx_prbs
+
+        # New data shares what is left; a UE out of coverage (CQI 0) gets nothing.
+        reachable = bits > 0
+        need = np.zeros(self.ues.size, dtype=np.int64)
+        need[reachable] = -(-self.ues.backlog_bytes[reachable] * 8 // bits[reachable])
+        need[self.ues.full_buffer & reachable] = free
+        prbs = share_prbs(np.minimum(need, free), free, slot)
+        scheduled = np.flatnonzero(prbs)
+        if sinr is None or cqi is None:
+            decoded = np.ones(scheduled.size, dtype=np.bool_)
+        else:
+            failure = bler(sinr[scheduled], cqi[scheduled])
+            decoded = self._decoding.random(scheduled.size) >= failure
+        m.blocks_sent[scheduled] += 1
+
+        for i, ok in zip(scheduled.tolist(), decoded.tolist(), strict=True):
+            capacity = int(prbs[i] * bits[i] // 8)
+            buffer = self.ues.buffers[i]
+            arrivals: list[float] = []
+            first_seq = 0
+            if buffer is None:
+                sent = capacity
+            else:
+                first_seq = buffer.head_seq
+                sent = self.ues.serve(i, capacity, arrivals)
+            queue = self.delivery[i]
+            if ok:
+                delivered[i] += sent
+                if queue is None:
+                    continue
+                if not len(queue):
+                    before = len(delays)
+                    m.packets_lost[i] += queue.deliver(first_seq, arrivals, t1, delays)
+                    delay_ue.extend([i] * (len(delays) - before))
+                    continue
+            block = TransportBlock(
+                ue=i,
+                prbs=int(prbs[i]),
+                cqi=0 if cqi is None else int(cqi[i]),
+                nbytes=sent,
+                first_seq=first_seq,
+                arrivals=arrivals,
+                partial_tail=buffer is not None and buffer.head_started,
+                sinr_db=[] if sinr is None else [float(sinr[i])],
+            )
+            if ok:
+                # Decoded, but an earlier block for this UE is still pending.
+                block.state = BlockState.DECODED
+            else:
+                assert self.harq is not None
+                m.blocks_failed[i] += 1
+                self.harq.failed(block, slot)
+                if block.state is BlockState.DROPPED:
+                    m.blocks_dropped[i] += 1
+                    m.dropped_bytes[i] += sent
+                    resolved.add(i)
+            if queue is not None:
+                queue.add(block)
+
+        for i in sorted(resolved):
+            queue = self.delivery[i]
+            if queue is not None:
+                before = len(delays)
+                m.packets_lost[i] += queue.release(t1, delays)
+                delay_ue.extend([i] * (len(delays) - before))
+
+        m.record_slot(slot, retx_prbs + int(prbs.sum()), delivered)
+        m.record_delays(np.asarray(delay_ue, dtype=np.intp), np.asarray(delays, dtype=np.float64))
 
         # Packets arriving during the slot wait for a later one.
         for source, start in zip(self.sources, self._group_start, strict=True):
-            arrivals = source.arrivals(t0, t1)
-            if len(arrivals):
-                self._enqueue(arrivals, start)
+            incoming = source.arrivals(t0, t1)
+            if len(incoming):
+                self._enqueue(incoming, start)
         self.slot += 1
 
     def _enqueue(self, arrivals: Arrivals, start: int) -> None:

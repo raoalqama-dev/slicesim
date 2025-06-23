@@ -9,9 +9,12 @@ import numpy as np
 import numpy.typing as npt
 
 from slicesim.carrier import Carrier
-from slicesim.config import Scenario
+from slicesim.channel.link import bits_per_prb
+from slicesim.config import AdaptiveLink, Scenario
 
 DELAY_PERCENTILES = (50.0, 95.0, 99.0)
+
+IntArray = npt.NDArray[np.int64]
 
 
 class MetricsCollector:
@@ -22,25 +25,34 @@ class MetricsCollector:
         self.offered_bytes = np.zeros(n_ues, dtype=np.int64)
         self.packets_arrived = np.zeros(n_ues, dtype=np.int64)
         self.delivered_bytes = np.zeros(n_ues, dtype=np.int64)
+        """Bytes in transport blocks that decoded."""
         self.packets_delivered = np.zeros(n_ues, dtype=np.int64)
+        self.packets_lost = np.zeros(n_ues, dtype=np.int64)
+        self.blocks_sent = np.zeros(n_ues, dtype=np.int64)
+        """First transmissions of transport blocks."""
+        self.blocks_failed = np.zeros(n_ues, dtype=np.int64)
+        """First transmissions that did not decode."""
+        self.retransmissions = np.zeros(n_ues, dtype=np.int64)
+        self.blocks_dropped = np.zeros(n_ues, dtype=np.int64)
+        self.dropped_bytes = np.zeros(n_ues, dtype=np.int64)
+        self.cqi_sum = np.zeros(n_ues, dtype=np.int64)
+        """Sum of each UE's reported CQI over the slots so far."""
         self.prb_used = np.zeros(n_slots, dtype=np.int32)
         self._delay_ue: list[npt.NDArray[np.intp]] = []
         self._delay_s: list[npt.NDArray[np.float64]] = []
 
-    def record_arrivals(self, ue: npt.NDArray[np.intp], size: npt.NDArray[np.int64]) -> None:
+    def record_arrivals(self, ue: npt.NDArray[np.intp], size: IntArray) -> None:
         """Count packets arriving at the gNB, one entry per packet."""
         self.offered_bytes += np.bincount(ue, weights=size, minlength=self.n_ues).astype(np.int64)
         self.packets_arrived += np.bincount(ue, minlength=self.n_ues)
 
-    def record_slot(
-        self, slot: int, prbs: npt.NDArray[np.int64], delivered: npt.NDArray[np.int64]
-    ) -> None:
-        """Record one slot's PRB allocation and the bytes it delivered to each UE."""
-        self.prb_used[slot] = int(prbs.sum())
+    def record_slot(self, slot: int, prbs_used: int, delivered: IntArray) -> None:
+        """Record how many PRBs a slot used and the bytes it delivered to each UE."""
+        self.prb_used[slot] = prbs_used
         self.delivered_bytes += delivered
 
     def record_delays(self, ue: npt.NDArray[np.intp], delay_s: npt.NDArray[np.float64]) -> None:
-        """Record completed packets, each with the delay from arrival to delivery."""
+        """Record delivered packets, each with the delay from arrival to delivery."""
         if ue.size:
             self._delay_ue.append(ue)
             self._delay_s.append(delay_s)
@@ -87,8 +99,12 @@ class GroupSummary:
     """Offered load measured from arrivals; None for full-buffer traffic."""
     delivered_mbps: float
     per_ue_mbps: float
+    mean_sinr_db: float | None
+    """Mean over the group's UEs of their SINR before fading; None for the fixed link."""
+    mean_cqi: float | None
     packets_arrived: int
     packets_delivered: int
+    packets_lost: int
     delay: DelayStats | None
     backlog_bytes: int
     """Bytes still queued at the end of the run."""
@@ -100,10 +116,15 @@ class CellSummary:
 
     duration_s: float
     n_slots: int
-    capacity_mbps: float
-    """What the cell delivers with every PRB in use."""
+    peak_mbps: float
+    """What the cell delivers with every PRB in use at the highest rate."""
     delivered_mbps: float
     prb_utilization: float
+    bler: float | None
+    """Share of first transmissions that failed; None if nothing was sent."""
+    residual_bler: float | None
+    """Share of transport blocks dropped after every HARQ transmission failed."""
+    retransmissions: int
 
 
 @dataclass(frozen=True)
@@ -118,6 +139,10 @@ class RunSummary:
         return asdict(self)
 
 
+def _ratio(numerator: int, denominator: int) -> float | None:
+    return numerator / denominator if denominator else None
+
+
 @dataclass(frozen=True)
 class SimulationResult:
     """Everything a finished run recorded, per UE and per packet."""
@@ -127,14 +152,28 @@ class SimulationResult:
     n_slots: int
     ue_group: npt.NDArray[np.intp]
     full_buffer: npt.NDArray[np.bool_]
-    offered_bytes: npt.NDArray[np.int64]
-    delivered_bytes: npt.NDArray[np.int64]
-    packets_arrived: npt.NDArray[np.int64]
-    packets_delivered: npt.NDArray[np.int64]
-    backlog_bytes: npt.NDArray[np.int64]
+    offered_bytes: IntArray
+    delivered_bytes: IntArray
+    packets_arrived: IntArray
+    packets_delivered: IntArray
+    packets_lost: IntArray
+    backlog_bytes: IntArray
+    in_flight_bytes: IntArray
+    """Bytes in blocks waiting for a retransmission when the run ended."""
+    dropped_bytes: IntArray
+    blocks_sent: IntArray
+    blocks_failed: IntArray
+    retransmissions: IntArray
+    blocks_dropped: IntArray
     delay_ue: npt.NDArray[np.intp]
     delay_s: npt.NDArray[np.float64]
     prb_used: npt.NDArray[np.int32]
+    distance_m: npt.NDArray[np.float64] | None
+    """Ground distance of each UE from the gNB; None for the fixed link."""
+    los: npt.NDArray[np.bool_] | None
+    mean_sinr_db: npt.NDArray[np.float64] | None
+    """Each UE's SINR before fading."""
+    mean_cqi: npt.NDArray[np.float64] | None
 
     @property
     def duration_s(self) -> float:
@@ -143,6 +182,16 @@ class SimulationResult:
     def throughput_bps(self) -> npt.NDArray[np.float64]:
         """Each UE's mean delivered throughput over the run."""
         return self.delivered_bytes * 8 / self.duration_s
+
+    def peak_bps(self) -> float:
+        """The cell's rate with every PRB carrying the most it can."""
+        link = self.scenario.link
+        per_prb = (
+            int(bits_per_prb(15, link.overhead))
+            if isinstance(link, AdaptiveLink)
+            else link.bits_per_prb
+        )
+        return self.carrier.n_prb * per_prb / self.carrier.slot_duration_s
 
     def summary(self) -> RunSummary:
         duration = self.duration_s
@@ -163,20 +212,31 @@ class SimulationResult:
                     ),
                     delivered_mbps=delivered_bits / duration / 1e6,
                     per_ue_mbps=delivered_bits / duration / 1e6 / int(members.sum()),
+                    mean_sinr_db=(
+                        None
+                        if self.mean_sinr_db is None
+                        else float(self.mean_sinr_db[members].mean())
+                    ),
+                    mean_cqi=None
+                    if self.mean_cqi is None
+                    else float(self.mean_cqi[members].mean()),
                     packets_arrived=int(self.packets_arrived[members].sum()),
                     packets_delivered=int(self.packets_delivered[members].sum()),
+                    packets_lost=int(self.packets_lost[members].sum()),
                     delay=DelayStats.of(self.delay_s[members[self.delay_ue]]),
                     backlog_bytes=int(self.backlog_bytes[members].sum()),
                 )
             )
-        slot_s = self.carrier.slot_duration_s
-        capacity = self.carrier.n_prb * self.scenario.link.bits_per_prb / slot_s
+        sent = int(self.blocks_sent.sum())
         cell = CellSummary(
             duration_s=duration,
             n_slots=self.n_slots,
-            capacity_mbps=capacity / 1e6,
+            peak_mbps=self.peak_bps() / 1e6,
             delivered_mbps=float(self.delivered_bytes.sum()) * 8 / duration / 1e6,
             prb_utilization=float(self.prb_used.sum()) / (self.carrier.n_prb * self.n_slots),
+            bler=_ratio(int(self.blocks_failed.sum()), sent),
+            residual_bler=_ratio(int(self.blocks_dropped.sum()), sent),
+            retransmissions=int(self.retransmissions.sum()),
         )
         return RunSummary(
             scenario=self.scenario.name,

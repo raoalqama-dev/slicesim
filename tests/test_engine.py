@@ -1,10 +1,15 @@
+from collections.abc import Callable
 from dataclasses import fields
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 import pytest
 
 from factories import poisson_group, scenario
+from slicesim.config import Scenario
 from slicesim.engine import RngStreams, Simulation, share_prbs, simulate
+from slicesim.harq import TransportBlock
 from slicesim.metrics import SimulationResult
 from slicesim.traffic import Periodic
 
@@ -145,7 +150,7 @@ class TestSlotLoop:
         # 106 PRBs of 8 bits carry 106 bytes per 1 ms slot; 300 bytes need 3 slots.
         s = scenario(
             carrier={"bandwidth_mhz": 20, "scs_khz": 15},
-            link={"bits_per_prb": 8},
+            link={"model": "fixed", "bits_per_prb": 8},
             duration_s=0.1,
             ues=[
                 {
@@ -204,3 +209,177 @@ class TestSlotLoop:
         r = simulate(scenario(ues=groups, duration_s=1.0))
         assert r.ue_group.size == 100
         assert r.n_slots == 2000
+
+
+def radio(**changes: Any) -> Scenario:
+    """A scenario over the radio channel, by default without shadowing or fading."""
+    defaults: dict[str, Any] = {
+        "link": {"model": "adaptive", "cqi_delay_slots": 0},
+        "cell": {"radius_m": 100},
+        "channel": {"shadowing": False, "fading": "none"},
+    }
+    return scenario(**{**defaults, **changes})
+
+
+def one_ue(period_ms: float, duration_s: float = 0.05) -> Scenario:
+    return radio(
+        duration_s=duration_s,
+        ues=[
+            {
+                "name": "u",
+                "count": 1,
+                "traffic": {"model": "periodic", "period_ms": period_ms, "packet_bytes": 100},
+            }
+        ],
+    )
+
+
+def always(value: float) -> Callable[..., npt.NDArray[np.float64]]:
+    def fake_bler(sinr_db: npt.ArrayLike, cqi: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        return np.full(np.shape(sinr_db), value)
+
+    return fake_bler
+
+
+class TestRadioLink:
+    def test_runs_are_reproducible(self) -> None:
+        s = radio(channel={"fading": "rayleigh", "coherence_ms": 2}, duration_s=0.3)
+        assert_identical(simulate(s), simulate(s))
+
+    def test_bytes_are_conserved_through_harq(self) -> None:
+        s = radio(
+            link={"model": "adaptive", "cqi_delay_slots": 6, "max_transmissions": 2},
+            channel={"fading": "rayleigh", "coherence_ms": 1},
+            duration_s=1.0,
+        )
+        r = simulate(s)
+        assert r.blocks_failed.sum() > 0
+        assert r.blocks_dropped.sum() > 0
+        assert r.packets_lost.sum() > 0
+        p = ~r.full_buffer
+        assert np.array_equal(
+            r.delivered_bytes[p] + r.backlog_bytes[p] + r.in_flight_bytes[p] + r.dropped_bytes[p],
+            r.offered_bytes[p],
+        )
+        assert np.all(r.packets_delivered + r.packets_lost <= r.packets_arrived)
+        assert np.all(r.retransmissions <= r.blocks_failed * (2 - 1))
+
+    def test_a_retransmission_adds_one_round_trip(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("slicesim.engine.bler", always(1.0))
+        monkeypatch.setattr("slicesim.harq.bler", always(0.0))
+        sim = Simulation(one_ue(period_ms=10))
+        r = sim.run()
+        source = sim.sources[0]
+        assert isinstance(source, Periodic)
+        slot = 0.5e-3
+        arrivals = source.phase[0] + 0.01 * np.arange(r.delay_s.size)
+        arrival_slot = np.floor(arrivals / slot)
+        # Sent in the next slot, failed, resent 8 slots later and decoded.
+        assert np.allclose(r.delay_s, (arrival_slot + 10) * slot - arrivals)
+        assert r.blocks_failed[0] == r.blocks_sent[0]
+        # One retransmission per delivered packet; the last may still be pending.
+        assert r.retransmissions[0] == r.packets_delivered[0]
+        assert r.packets_lost[0] == 0
+
+    def test_later_blocks_wait_for_an_earlier_retransmission(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        failed: list[bool] = []
+
+        def fail_first_block(sinr_db: npt.ArrayLike, cqi: npt.ArrayLike) -> npt.NDArray[np.float64]:
+            shape = np.shape(sinr_db)
+            if not failed and np.size(sinr_db):
+                failed.append(True)
+                return np.ones(shape)
+            return np.zeros(shape)
+
+        monkeypatch.setattr("slicesim.engine.bler", fail_first_block)
+        monkeypatch.setattr("slicesim.harq.bler", always(0.0))
+        # A packet every slot: packet k is sent in slot k + 1.
+        sim = Simulation(one_ue(period_ms=0.5, duration_s=0.01))
+        r = sim.run()
+        source = sim.sources[0]
+        assert isinstance(source, Periodic)
+        arrivals = source.phase[0] + 0.5e-3 * np.arange(9)
+        # The first block is resent in slot 9; the eight packets behind it wait for it.
+        assert np.allclose(r.delay_s[:9], 10 * 0.5e-3 - arrivals)
+        later = r.delay_s[9:]
+        assert np.all(later < 2 * 0.5e-3 + 1e-12)
+        assert r.retransmissions[0] == 1
+
+    def test_four_failures_lose_the_packet(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("slicesim.engine.bler", always(1.0))
+        monkeypatch.setattr("slicesim.harq.bler", always(1.0))
+        r = simulate(one_ue(period_ms=10, duration_s=0.1))
+        assert r.packets_delivered[0] == 0
+        assert r.packets_lost[0] == r.blocks_dropped[0] >= 6
+        assert r.delivered_bytes[0] == 0
+        assert r.retransmissions[0] >= 3 * r.blocks_dropped[0]
+
+    def test_a_single_transmission_drops_at_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("slicesim.engine.bler", always(1.0))
+        s = one_ue(period_ms=10, duration_s=0.1)
+        data = s.model_dump()
+        data["link"]["max_transmissions"] = 1
+        r = simulate(s.model_validate(data))
+        assert r.retransmissions[0] == 0
+        assert r.blocks_dropped[0] == r.blocks_sent[0] == r.packets_lost[0] == 10
+        assert r.packets_delivered[0] == 0
+
+    def test_retransmissions_that_cannot_fit_are_an_error(self) -> None:
+        sim = Simulation(one_ue(period_ms=10))
+        assert sim.harq is not None
+        b = TransportBlock(
+            ue=0, prbs=52, cqi=9, nbytes=10, first_seq=0, arrivals=[], partial_tail=False
+        )
+        b.sinr_db.append(0.0)
+        sim.harq.failed(b, slot=-8)
+        with pytest.raises(RuntimeError, match="need 52 PRBs"):
+            sim.step()
+
+    def test_the_scheduler_uses_the_cqi_reported_earlier(self) -> None:
+        def alternating(slot: int) -> npt.NDArray[np.float64]:
+            # CQI 0 on even slots, CQI 15 on odd ones.
+            return np.full(1, -20.0 if slot % 2 == 0 else 30.0)
+
+        totals = []
+        for delay in (0, 1):
+            s = radio(
+                link={"model": "adaptive", "cqi_delay_slots": delay},
+                duration_s=0.005,
+                ues=[{"name": "bulk", "count": 1, "traffic": {"model": "full_buffer"}}],
+            )
+            sim = Simulation(s)
+            assert sim.channel is not None
+            sim.channel.sinr_db = alternating  # type: ignore[method-assign]
+            sim.run()
+            totals.append(int(sim.metrics.cqi_sum[0]))
+        # Ten slots: 0,15,0,15,... reported at once, and 0,0,15,0,15,... a slot late.
+        assert totals == [75, 60]
+
+    def test_ues_out_of_coverage_get_nothing(self) -> None:
+        s = radio(
+            cell={"radius_m": 5000, "min_distance_m": 4900, "tx_power_dbm": 0},
+            ues=[{"name": "far", "count": 3, "traffic": {"model": "full_buffer"}}],
+        )
+        r = simulate(s)
+        assert r.mean_cqi is not None
+        assert np.all(r.mean_cqi == 0)
+        assert r.delivered_bytes.sum() == 0
+        assert r.prb_used.sum() == 0
+
+    def test_retransmissions_go_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("slicesim.engine.bler", always(1.0))
+        monkeypatch.setattr("slicesim.harq.bler", always(0.0))
+        s = radio(
+            duration_s=0.05,
+            ues=[{"name": "bulk", "count": 2, "traffic": {"model": "full_buffer"}}],
+        )
+        r = simulate(s)
+        # Every new block fails. Eight slots later its retransmission fills the cell and
+        # decodes, leaving nothing for new data, so new data and retransmissions
+        # alternate in runs of eight slots: 52 slots of new data, 48 of retransmissions.
+        assert np.all(r.prb_used == 51)
+        assert r.blocks_sent.sum() == 2 * 52
+        assert r.retransmissions.sum() == 2 * 48
+        assert r.blocks_dropped.sum() == 0

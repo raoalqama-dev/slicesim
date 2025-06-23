@@ -10,32 +10,38 @@ class TestPacketBuffer:
         buffer.push([0.1, 0.2, 0.3], [100, 200, 300])
         assert len(buffer) == 3
         assert buffer.backlog_bytes == 600
-        delays: list[float] = []
-        assert buffer.serve(300, now=1.0, delays=delays) == 300
-        assert delays == pytest.approx([0.9, 0.8])
+        completed: list[float] = []
+        assert buffer.serve(300, completed) == 300
+        assert completed == [0.1, 0.2]
         assert buffer.backlog_bytes == 300
         assert len(buffer) == 1
+        assert buffer.head_seq == 2
+        assert not buffer.head_started
 
-    def test_a_packet_split_across_slots_is_delivered_with_its_last_byte(self) -> None:
+    def test_a_packet_split_across_blocks_completes_with_its_last_byte(self) -> None:
         buffer = PacketBuffer()
         buffer.push([0.0], [250])
-        delays: list[float] = []
-        assert buffer.serve(100, now=1.0, delays=delays) == 100
-        assert buffer.serve(100, now=2.0, delays=delays) == 100
-        assert delays == []
+        completed: list[float] = []
+        assert buffer.serve(100, completed) == 100
+        assert buffer.head_started
+        assert buffer.serve(100, completed) == 100
+        assert completed == []
+        assert buffer.head_seq == 0
         assert buffer.backlog_bytes == 50
-        assert buffer.serve(100, now=3.0, delays=delays) == 50
-        assert delays == [3.0]
+        assert buffer.serve(100, completed) == 50
+        assert completed == [0.0]
+        assert buffer.head_seq == 1
+        assert not buffer.head_started
         assert buffer.backlog_bytes == 0
         assert len(buffer) == 0
 
     def test_serving_more_than_the_backlog_sends_what_there_is(self) -> None:
         buffer = PacketBuffer()
         buffer.push([0.5, 0.5], [10, 20])
-        delays: list[float] = []
-        assert buffer.serve(1000, now=1.0, delays=delays) == 30
-        assert delays == [0.5, 0.5]
-        assert buffer.serve(1000, now=2.0, delays=delays) == 0
+        completed: list[float] = []
+        assert buffer.serve(1000, completed) == 30
+        assert completed == [0.5, 0.5]
+        assert buffer.serve(1000, completed) == 0
 
     def test_rejects_out_of_order_or_empty_packets(self) -> None:
         buffer = PacketBuffer()
@@ -61,19 +67,19 @@ class TestUEPopulation:
         ues = UEPopulation.from_groups([2], [False])
         ues.enqueue(1, [0.0, 0.1], [100, 50])
         assert ues.backlog_bytes.tolist() == [0, 150]
-        delays: list[float] = []
-        assert ues.serve(1, 120, 1.0, delays) == 120
+        completed: list[float] = []
+        assert ues.serve(1, 120, completed) == 120
         assert ues.backlog_bytes.tolist() == [0, 30]
-        assert delays == [1.0]
+        assert completed == [0.0]
         buffer = ues.buffers[1]
         assert buffer is not None
         assert buffer.backlog_bytes == 30
 
     def test_full_buffer_ues_take_whatever_they_are_given(self) -> None:
         ues = UEPopulation.from_groups([1], [True])
-        delays: list[float] = []
-        assert ues.serve(0, 4096, 1.0, delays) == 4096
-        assert delays == []
+        completed: list[float] = []
+        assert ues.serve(0, 4096, completed) == 4096
+        assert completed == []
         assert ues.backlog_bytes[0] == 0
         with pytest.raises(ValueError, match="full-buffer"):
             ues.enqueue(0, [0.0], [10])

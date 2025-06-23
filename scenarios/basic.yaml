@@ -1,4 +1,4 @@
-# Every traffic model sharing one 20 MHz cell. Run it with:
+# Every traffic model sharing one 20 MHz urban macro cell. Run it with:
 #   slicesim run scenarios/basic.yaml
 name: basic
 description: four traffic types sharing a 20 MHz cell
@@ -9,9 +9,23 @@ carrier:
   bandwidth_mhz: 20   # 51 PRBs at 30 kHz (TS 38.101-1 Table 5.3.2-1)
   scs_khz: 30         # numerology 1, 0.5 ms slots
 
+cell:                 # TR 38.901 urban macro, UEs dropped uniformly
+  radius_m: 300
+  frequency_ghz: 3.5
+  tx_power_dbm: 46
+  noise_figure_db: 7
+  interference_margin_db: 3
+
+channel:
+  shadowing: true     # log-normal, 4 dB LOS and 6 dB NLOS
+  fading: rayleigh
+  coherence_ms: 40    # a pedestrian at 3.5 GHz: Doppler 9.7 Hz, coherence 0.423 / f_D
+
 link:
-  model: fixed
-  bits_per_prb: 500   # about 51 Mbit/s with every PRB in use
+  model: adaptive     # CQI per TS 38.214 Table 5.2.2.1-2, 10% BLER target
+  cqi_delay_slots: 2
+  harq_rtt_slots: 8
+  max_transmissions: 4
 
 ues:
   - name: video

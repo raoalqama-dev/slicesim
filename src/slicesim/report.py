@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from slicesim.config import Scenario
+from slicesim.config import AdaptiveLink, FixedLink, Scenario
 from slicesim.metrics import RunSummary
 
 MISSING = "-"
@@ -42,39 +42,69 @@ def _number(value: float | None, digits: int = 2) -> str:
     return MISSING if value is None else f"{value:,.{digits}f}"
 
 
+def describe_link(scenario: Scenario) -> list[str]:
+    """Header lines describing the link and, for the adaptive link, the cell."""
+    link = scenario.link
+    if isinstance(link, FixedLink):
+        return [f"  link      fixed, {link.bits_per_prb} bits per PRB, no decoding errors"]
+    cell = scenario.cell
+    channel = scenario.channel
+    fading = (
+        f"Rayleigh fading ({channel.coherence_ms:g} ms coherence)"
+        if channel.fading == "rayleigh"
+        else "no fading"
+    )
+    shadowing = "shadowing" if channel.shadowing else "no shadowing"
+    return [
+        f"  cell      UMa at {cell.frequency_ghz:g} GHz, {cell.radius_m:g} m radius, "
+        f"{cell.tx_power_dbm:g} dBm, {shadowing}, {fading}",
+        f"  link      CQI-adaptive at 10% BLER, {link.overhead:.0%} overhead, CQI "
+        f"{link.cqi_delay_slots} slots old, HARQ every {link.harq_rtt_slots} slots "
+        f"up to {link.max_transmissions} transmissions",
+    ]
+
+
 def render_summary(summary: RunSummary, scenario: Scenario) -> str:
     """The summary ``slicesim run`` prints."""
     cell = summary.cell
     title = summary.scenario
     if scenario.description:
         title += f": {scenario.description}"
+    result = (
+        f"  result    {cell.delivered_mbps:,.2f} Mbit/s delivered of "
+        f"{cell.peak_mbps:,.1f} peak, {cell.prb_utilization:.1%} of PRBs used"
+    )
+    if isinstance(scenario.link, AdaptiveLink) and cell.bler is not None:
+        assert cell.residual_bler is not None
+        result += f", BLER {cell.bler:.1%}, {cell.residual_bler:.2%} of blocks dropped"
     header = [
         title,
         f"  seed      {summary.seed}",
         f"  duration  {cell.duration_s:g} s ({cell.n_slots:,} slots)",
         f"  carrier   {summary.carrier}",
-        f"  link      fixed, {scenario.link.bits_per_prb} bits per PRB "
-        f"(cell capacity {cell.capacity_mbps:,.1f} Mbit/s)",
-        f"  cell      {cell.delivered_mbps:,.2f} Mbit/s delivered, "
-        f"{cell.prb_utilization:.1%} of PRBs used",
+        *describe_link(scenario),
+        result,
     ]
     headers = [
         "group",
         "UEs",
         "traffic",
-        "offered Mb/s",
-        "delivered Mb/s",
-        "per UE Mb/s",
+        "offered",
+        "delivered",
+        "per UE",
+        "SINR",
+        "CQI",
         "packets",
-        "delay mean ms",
+        "lost",
+        "delay",
         "p50",
         "p95",
         "p99",
-        "queued kB",
+        "queued",
     ]
     rows = []
     for g in summary.groups:
-        packets = MISSING if g.offered_mbps is None else f"{g.packets_delivered:,}"
+        packet_traffic = g.offered_mbps is not None
         delay = g.delay
         rows.append(
             [
@@ -84,12 +114,20 @@ def render_summary(summary: RunSummary, scenario: Scenario) -> str:
                 _number(g.offered_mbps),
                 _number(g.delivered_mbps),
                 _number(g.per_ue_mbps, 3),
-                packets,
+                _number(g.mean_sinr_db, 1),
+                _number(g.mean_cqi, 1),
+                f"{g.packets_delivered:,}" if packet_traffic else MISSING,
+                f"{g.packets_lost:,}" if packet_traffic else MISSING,
                 _number(None if delay is None else delay.mean_ms),
                 _number(None if delay is None else delay.p50_ms),
                 _number(None if delay is None else delay.p95_ms),
                 _number(None if delay is None else delay.p99_ms),
-                _number(None if g.offered_mbps is None else g.backlog_bytes / 1e3, 1),
+                _number(g.backlog_bytes / 1e3 if packet_traffic else None, 1),
             ]
         )
-    return "\n".join([*header, "", format_table(headers, rows, "lrl" + "r" * 9)])
+    legend = (
+        "Throughput in Mbit/s; SINR in dB before fading; packets delivered and lost; "
+        "delay (mean and percentiles) in ms; queued in kB."
+    )
+    table = format_table(headers, rows, "lrl" + "r" * 12)
+    return "\n".join([*header, "", table, "", legend])

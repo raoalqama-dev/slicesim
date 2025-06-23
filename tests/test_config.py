@@ -6,6 +6,9 @@ from pydantic import ValidationError
 
 from factories import poisson_group, scenario, scenario_data
 from slicesim.config import (
+    AdaptiveLink,
+    CellConfig,
+    ChannelConfig,
     FixedLink,
     OnOffTraffic,
     PoissonTraffic,
@@ -38,10 +41,29 @@ def test_a_scenario_parses_into_typed_models() -> None:
     assert s.link == FixedLink(bits_per_prb=500)
 
 
-def test_link_defaults_to_a_fixed_rate() -> None:
+def test_the_radio_channel_is_the_default() -> None:
     data = scenario_data()
     del data["link"]
-    assert parse_scenario(data).link == FixedLink(model="fixed", bits_per_prb=500)
+    s = parse_scenario(data)
+    assert s.link == AdaptiveLink(
+        model="adaptive", overhead=0.14, cqi_delay_slots=2, harq_rtt_slots=8, max_transmissions=4
+    )
+    assert s.cell == CellConfig(
+        radius_m=300,
+        min_distance_m=35,
+        ue_height_m=1.5,
+        frequency_ghz=3.5,
+        tx_power_dbm=46,
+        antenna_gain_db=0,
+        noise_figure_db=7,
+        interference_margin_db=3,
+    )
+    assert s.channel == ChannelConfig(shadowing=True, fading="rayleigh", coherence_ms=40)
+
+
+def test_the_fixed_link_takes_a_rate() -> None:
+    s = scenario(link={"model": "fixed", "bits_per_prb": 640})
+    assert s.link == FixedLink(bits_per_prb=640)
 
 
 @pytest.mark.parametrize(
@@ -99,10 +121,34 @@ def test_duration_becomes_whole_slots(duration_s: float, scs: int, slots: int) -
         ({"duration_s": 0.0001}, "duration_s must cover at least one slot (0.5 ms at 30 kHz)"),
         ({"duration_s": -1}, "duration_s: Input should be greater than 0 (got -1)"),
         ({"ues": []}, "ues: List should have at least 1 item after validation, not 0"),
-        ({"link": {"model": "adaptive"}}, "link.model: Input should be 'fixed' (got 'adaptive')"),
         (
-            {"link": {"bits_per_prb": 0}},
+            {"link": {"model": "turbo"}},
+            "link: unknown 'model' 'turbo'; expected one of 'adaptive', 'fixed'",
+        ),
+        ({"link": {"bits_per_prb": 600}}, "link: 'model' is required"),
+        (
+            {"link": {"model": "fixed", "bits_per_prb": 0}},
             "link.bits_per_prb: Input should be greater than 0 (got 0)",
+        ),
+        (
+            {"link": {"model": "adaptive", "max_transmissions": 0}},
+            "link.max_transmissions: Input should be greater than or equal to 1 (got 0)",
+        ),
+        (
+            {"link": {"model": "adaptive", "bits_per_prb": 600}},
+            "link.bits_per_prb: unknown field",
+        ),
+        (
+            {"cell": {"radius_m": 30}},
+            "cell: radius_m must be larger than min_distance_m",
+        ),
+        (
+            {"cell": {"ue_height_m": 20}},
+            "cell.ue_height_m: Input should be less than or equal to 13 (got 20)",
+        ),
+        (
+            {"channel": {"fading": "jakes"}},
+            "channel.fading: Input should be 'rayleigh' or 'none' (got 'jakes')",
         ),
         ({"seed": -3}, "seed: Input should be greater than or equal to 0 (got -3)"),
         ({"colour": "red"}, "colour: unknown field"),
