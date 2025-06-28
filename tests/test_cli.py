@@ -11,7 +11,7 @@ from factories import scenario, scenario_data
 from slicesim import __version__
 from slicesim.cli import main
 from slicesim.engine import simulate
-from slicesim.report import format_table, render_summary
+from slicesim.report import format_table, render_comparison, render_summary
 
 BASIC = Path(__file__).resolve().parent.parent / "scenarios" / "basic.yaml"
 
@@ -50,6 +50,7 @@ def test_run_prints_a_summary_table(small: Path) -> None:
         "delivered",
         "per",
         "UE",
+        "Jain",
         "SINR",
         "CQI",
         "packets",
@@ -58,14 +59,16 @@ def test_run_prints_a_summary_table(small: Path) -> None:
         "p50",
         "p95",
         "p99",
-        "queued",
+        "buffer",
     ]
     table = lines[lines.index(header) + 2 : lines.index(header) + 6]
     rows = {line.split()[0]: line.split() for line in table}
     assert set(rows) == {"web", "ctrl", "video", "bulk"}
     assert rows["web"][1:3] == ["4", "poisson"]
     # The fixed link has no SINR or CQI; full-buffer UEs have no packets.
-    assert rows["web"][6:8] == ["-", "-"]
+    assert rows["web"][7:9] == ["-", "-"]
+    assert 0 < float(rows["web"][6]) <= 1  # Jain
+    assert "  scheduler round robin" in lines
     assert rows["bulk"][3] == "-"
     assert rows["bulk"][-1] == "-"
     assert lines[-1].startswith("Throughput in Mbit/s;")
@@ -90,8 +93,8 @@ def test_run_over_the_radio_channel(tmp_path: Path) -> None:
     assert "BLER" in result
     assert "of blocks dropped" in result
     web = next(line for line in lines if line.startswith("web")).split()
-    assert float(web[6]) > 0  # mean SINR
-    assert 0 < float(web[7]) <= 15  # mean CQI
+    assert float(web[7]) > 0  # mean SINR
+    assert 0 < float(web[8]) <= 15  # mean CQI
 
     data["channel"] = {"shadowing": False, "fading": "none"}
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
@@ -215,4 +218,76 @@ def test_render_summary_without_a_description_or_deliveries() -> None:
     assert text.splitlines()[0] == "test"
     row = next(line for line in text.splitlines() if line.startswith("rare")).split()
     # Nothing was delivered yet, so there are no delay statistics.
-    assert row[10:14] == ["-", "-", "-", "-"]
+    assert row[11:15] == ["-", "-", "-", "-"]
+
+
+FAIRNESS = Path(__file__).resolve().parent.parent / "scenarios" / "fairness.yaml"
+
+
+def test_compare_prints_one_row_per_scheduler() -> None:
+    code, out, err = run("compare", str(FAIRNESS), "--duration", "0.2")
+    assert (code, err) == (0, "")
+    lines = out.splitlines()
+    assert lines[0] == "fairness: twenty full-buffer UEs across a 500 m cell"
+    header = next(line for line in lines if line.startswith("scheduler"))
+    assert header.split() == [
+        "scheduler",
+        "delivered",
+        "Jain",
+        "edge",
+        "UE",
+        "median",
+        "UE",
+        "delay",
+        "p50",
+        "p95",
+        "p99",
+        "buffer",
+        "BLER",
+    ]
+    start = lines.index(header) + 2
+    names = [line.split("  ")[0].strip() for line in lines[start : start + 3]]
+    assert names == ["round robin", "max C/I", "proportional fair (100 ms average)"]
+    assert lines[-1].startswith("Throughput in Mbit/s;")
+
+
+def test_compare_runs_the_schedulers_named(small: Path) -> None:
+    code, out, _ = run("compare", str(small), "--schedulers", "pf, maxci", "--json")
+    assert code == 0
+    data = json.loads(out)
+    assert [entry["scheduler"]["model"] for entry in data] == ["pf", "maxci"]
+    assert data[0]["scheduler"]["time_constant_ms"] == 100
+    assert data[0]["seed"] == data[1]["seed"] == 7
+    assert data[0]["cell"]["jain"] is not None
+    # The fixed link never fails, so the BLER column is empty.
+    _, out, _ = run("compare", str(small), "--schedulers", "rr")
+    row = next(line for line in out.splitlines() if line.startswith("round robin"))
+    assert row.split()[-1] == "-"
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("rr,edf", "unknown scheduler 'edf'; choose from rr, maxci, pf"),
+        ("rr,rr", "each scheduler may be named once"),
+        (",", "name at least one scheduler"),
+    ],
+)
+def test_compare_rejects_bad_scheduler_lists(
+    value: str, message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as info:
+        main(["compare", "x.yaml", "--schedulers", value])
+    assert info.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+def test_compare_reports_an_invalid_scenario(tmp_path: Path) -> None:
+    code, _, err = run("compare", str(tmp_path / "missing.yaml"))
+    assert code == 2
+    assert "cannot read file" in err
+
+
+def test_render_comparison_needs_runs() -> None:
+    with pytest.raises(ValueError, match="nothing to compare"):
+        render_comparison([])

@@ -1,9 +1,9 @@
 """Scenario files: pydantic models and YAML loading.
 
 A scenario describes one simulation completely: the carrier, the cell and
-its radio channel, the link model, the UEs and their traffic, how long to run
-and the seed. Unknown keys are rejected, so a misspelt option fails loudly instead of
-being ignored.
+its radio channel, the link model, the scheduler, the UEs and their traffic,
+how long to run and the seed. Unknown keys are rejected, so a misspelt option
+fails loudly instead of being ignored.
 """
 
 from __future__ import annotations
@@ -58,8 +58,8 @@ class CellConfig(_Model):
 
     @model_validator(mode="after")
     def _check_area(self) -> CellConfig:
-        if self.radius_m <= self.min_distance_m:
-            raise ValueError("radius_m must be larger than min_distance_m")
+        if self.radius_m < self.min_distance_m:
+            raise ValueError("radius_m must be at least min_distance_m")
         return self
 
 
@@ -89,6 +89,31 @@ class FixedLink(_Model):
 
 
 LinkConfig = Annotated[AdaptiveLink | FixedLink, Field(discriminator="model")]
+
+
+class RoundRobinScheduler(_Model):
+    """Equal PRBs for every UE with data waiting."""
+
+    model: Literal["rr"] = "rr"
+
+
+class MaxCIScheduler(_Model):
+    """The best channel first."""
+
+    model: Literal["maxci"] = "maxci"
+
+
+class ProportionalFairScheduler(_Model):
+    """The best channel relative to the UE's average throughput."""
+
+    model: Literal["pf"] = "pf"
+    time_constant_ms: float = Field(default=100.0, gt=0, le=100_000)
+
+
+SchedulerConfig = Annotated[
+    RoundRobinScheduler | MaxCIScheduler | ProportionalFairScheduler,
+    Field(discriminator="model"),
+]
 
 
 class FullBufferTraffic(_Model):
@@ -148,6 +173,7 @@ class Scenario(_Model):
     cell: CellConfig = CellConfig()
     channel: ChannelConfig = ChannelConfig()
     link: LinkConfig = AdaptiveLink()
+    scheduler: SchedulerConfig = RoundRobinScheduler()
     ues: list[UEGroup] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -197,6 +223,7 @@ def _tags(*models: type[BaseModel]) -> frozenset[str]:
 _UNION_TAGS = {
     "traffic": _tags(FullBufferTraffic, PoissonTraffic, PeriodicTraffic, OnOffTraffic),
     "link": _tags(AdaptiveLink, FixedLink),
+    "scheduler": _tags(RoundRobinScheduler, MaxCIScheduler, ProportionalFairScheduler),
 }
 
 

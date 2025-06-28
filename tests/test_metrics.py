@@ -5,7 +5,7 @@ import pytest
 
 from factories import scenario
 from slicesim.engine import simulate
-from slicesim.metrics import DelayStats, MetricsCollector
+from slicesim.metrics import DelayStats, MetricsCollector, jain_index
 
 
 def test_delay_stats_in_milliseconds() -> None:
@@ -84,7 +84,47 @@ def test_summary_serializes_to_json() -> None:
         "bler",
         "residual_bler",
         "retransmissions",
+        "jain",
+        "edge_mbps",
+        "median_ue_mbps",
+        "delay",
+        "mean_buffer_bytes",
     }
+    assert set(data["groups"][0]) >= {"jain", "mean_buffer_bytes"}
+
+
+def test_cell_kpis() -> None:
+    r = simulate(scenario(duration_s=1.0))
+    cell = r.summary().cell
+    throughput = r.throughput_bps() / 1e6
+    assert cell.edge_mbps == pytest.approx(float(np.percentile(throughput, 5)))
+    assert cell.median_ue_mbps == pytest.approx(float(np.median(throughput)))
+    assert cell.jain == pytest.approx(
+        throughput.sum() ** 2 / (throughput.size * (throughput**2).sum())
+    )
+    assert cell.delay is not None
+    assert cell.delay.p99_ms >= cell.delay.p50_ms
+
+
+def test_buffer_occupancy_is_a_time_average() -> None:
+    # One UE, a 1,000-byte packet every 10 ms, and 106 bytes per 1 ms slot. A packet
+    # joins the queue after the slot it arrives in, then drains over 10 slots: queued
+    # bytes summed over the slot starts are 1000 + 894 + ... + 46 = 5,230 per packet.
+    s = scenario(
+        carrier={"bandwidth_mhz": 20, "scs_khz": 15},
+        link={"model": "fixed", "bits_per_prb": 8},
+        duration_s=1.0,
+        ues=[
+            {
+                "name": "u",
+                "count": 1,
+                "traffic": {"model": "periodic", "period_ms": 10, "packet_bytes": 1000},
+            }
+        ],
+    )
+    r = simulate(s)
+    per_packet = sum(1000 - 106 * k for k in range(10))
+    assert r.mean_buffer_bytes[0] == pytest.approx(per_packet * 100 / 1000, rel=0.02)
 
 
 def test_summary_of_a_run_over_the_radio_channel() -> None:
@@ -119,3 +159,11 @@ def test_ratios_of_an_idle_cell_are_undefined() -> None:
     )
     cell = simulate(s).summary().cell
     assert (cell.bler, cell.residual_bler) == (None, None)
+
+
+def test_jain_index() -> None:
+    assert jain_index([5, 5, 5, 5]) == pytest.approx(1.0)
+    assert jain_index([1, 0, 0, 0]) == pytest.approx(0.25)
+    assert jain_index([3, 1]) == pytest.approx(16 / 20)
+    assert jain_index([0, 0]) is None
+    assert jain_index([]) is None

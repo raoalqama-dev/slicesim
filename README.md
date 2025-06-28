@@ -13,9 +13,10 @@ specifications they implement.
 over a TR 38.901 urban macro cell, with path loss, shadowing and Rayleigh block
 fading. Transport blocks are sized from the CQI each UE reports (TS 38.214),
 fail with a BLER that depends on the SINR they meet, and are retransmitted by
-HARQ. Four traffic models, per-packet delay and loss, and validated scenario
-files complete the core. Until the MAC schedulers arrive, the PRBs are shared
-equally; they are next on the [roadmap](#roadmap).
+HARQ. Round robin, max C/I and proportional fair schedulers share the PRBs, and
+`slicesim compare` runs a scenario under each of them. Four traffic models,
+per-packet delay and loss, and validated scenario files complete the core.
+Network slicing is next on the [roadmap](#roadmap).
 
 ## Quick start
 
@@ -34,21 +35,23 @@ basic: four traffic types sharing a 20 MHz cell
   carrier   20 MHz at 30 kHz (numerology 1): 51 PRBs, 0.5 ms slots
   cell      UMa at 3.5 GHz, 300 m radius, 46 dBm, shadowing, Rayleigh fading (40 ms coherence)
   link      CQI-adaptive at 10% BLER, 14% overhead, CQI 2 slots old, HARQ every 8 slots up to 4 transmissions
+  scheduler round robin
   result    46.46 Mbit/s delivered of 81.8 peak, 100.0% of PRBs used, BLER 2.6%, 0.19% of blocks dropped
 
-group    UEs  traffic      offered  delivered  per UE  SINR   CQI  packets  lost  delay   p50    p95    p99  queued
--------  ---  -----------  -------  ---------  ------  ----  ----  -------  ----  -----  ----  -----  -----  ------
-video      8  on_off         15.75      15.71   1.963  28.6  12.7    1,548    23   9.21  7.08  20.54  39.28    23.1
-control   10  periodic        0.80       0.80   0.080  34.5  13.1    9,997     0   0.91  0.79   0.87   4.78     0.2
-sensors   50  poisson         0.16       0.16   0.003  24.2  12.2      970     0   1.00  0.76   1.39   4.97     0.0
-bulk       2  full_buffer        -      29.80  14.899  16.4  10.4        -     -      -     -      -      -       -
+group    UEs  traffic      offered  delivered  per UE   Jain  SINR   CQI  packets  lost  delay   p50    p95    p99  buffer
+-------  ---  -----------  -------  ---------  ------  -----  ----  ----  -------  ----  -----  ----  -----  -----  ------
+video      8  on_off         15.75      15.71   1.963  0.954  28.6  12.7    1,548    23   9.21  7.08  20.54  39.28     1.2
+control   10  periodic        0.80       0.80   0.080  1.000  34.5  13.1    9,997     0   0.91  0.79   0.87   4.78     0.0
+sensors   50  poisson         0.16       0.16   0.003  0.945  24.2  12.2      970     0   1.00  0.76   1.39   4.97     0.0
+bulk       2  full_buffer        -      29.80  14.899  0.935  16.4  10.4        -     -      -     -      -      -       -
 
-Throughput in Mbit/s; SINR in dB before fading; packets delivered and lost; delay (mean and percentiles) in ms; queued in kB.
+Throughput in Mbit/s; Jain's index over the group's UEs; SINR in dB before fading; packets delivered and lost; delay (mean and percentiles) in ms; buffer is the average queue per UE in kB.
 ```
 
-Each row is one UE group: the load it offered and the throughput it got, its
-mean SINR and reported CQI, the packets delivered and lost, their delay from
-arrival at the gNB to delivery, and what was still queued at the end.
+Each row is one UE group: the load it offered and the throughput it got, how
+evenly that throughput was spread over its UEs (Jain's index), its mean SINR and
+reported CQI, the packets delivered and lost, their delay from arrival at the gNB
+to delivery, and the average queue per UE.
 Full-buffer UEs always have data waiting, so they have no offered load, packets
 or delay; here two of them soak up the capacity the others leave. The control
 group's 99th percentile, 4.78 ms, is one HARQ retransmission (8 slots of
@@ -57,6 +60,47 @@ group's 99th percentile, 4.78 ms, is one HARQ retransmission (8 slots of
 `--seed N` and `--duration SECONDS` override the scenario, and `--json` prints
 the same summary as JSON. The same scenario and seed always print the same
 result.
+
+## Comparing schedulers
+
+`slicesim compare` runs a scenario once per scheduler and prints one row each.
+Every run keeps the seed, and since every random stream is named rather than
+drawn in order, all schedulers see the same UE positions, channels and packet
+arrivals:
+
+```text
+$ slicesim compare scenarios/fairness.yaml
+fairness: twenty full-buffer UEs across a 500 m cell
+  ...
+
+scheduler                           delivered   Jain  edge UE  median UE  delay  p50  p95  p99  buffer  BLER
+----------------------------------  ---------  -----  -------  ---------  -----  ---  ---  ---  ------  ----
+round robin                             38.80  0.736    0.606      1.554      -    -    -    -     0.0  2.9%
+max C/I                                 80.86  0.218    0.000      0.000      -    -    -    -     0.0  0.8%
+proportional fair (100 ms average)      45.79  0.783    0.848      1.974      -    -    -    -     0.0  3.4%
+```
+
+`--schedulers rr,pf` picks which to run. Jain's index here is over every UE's
+throughput, which is meaningful when the UEs have alike traffic, as these
+full-buffer ones do; the edge UE is the 5th percentile of per-UE throughput.
+
+What the table shows:
+
+- **Max C/I doubles the cell throughput and starves the edge.** It always
+  serves the best channels, so the far UEs get nothing at all.
+- **Proportional fair beats round robin on both throughput and fairness.** RR
+  gives every UE the same PRBs every slot, whatever its fading. PF gives each UE
+  its turn when its channel is good relative to its own average, so UEs are
+  served near their fading peaks. The gain is largest where rate grows fastest
+  with SINR, at low SINR, so the edge UEs gain the most (+40% at the 5th
+  percentile, against +27% at the median) and throughput ends up more even than
+  under RR. With equal channels, where only fading tells the UEs apart, the two
+  are equally fair: both within 0.002 of perfect, and which edges ahead depends
+  on the seed.
+- **With packet traffic PF also cuts delay.** A UE that has been idle has a
+  low average, so its next packet goes out first. In `scenarios/basic.yaml`
+  the 99th percentile delay over every packet is 8.6 ms under PF, 18.5 ms under
+  RR and over a second under max C/I.
 
 ## Scenarios
 
@@ -94,6 +138,10 @@ link:                 # the defaults
   cqi_delay_slots: 2
   harq_rtt_slots: 8
   max_transmissions: 4
+
+scheduler:            # rr (the default), maxci, or pf
+  model: pf
+  time_constant_ms: 100     # pf only: the throughput average's time constant
 
 ues:
   - name: video
@@ -181,10 +229,21 @@ Arrival times are exact rather than rounded to slots, and a packet's delay runs
 to the end of the slot in which it is released. Per-UE quantities are numpy
 arrays; 100 UEs for 10,000 slots take under six seconds on a laptop.
 
-**Allocation.** Until the MAC schedulers arrive (feature 3), the PRBs are split
-equally among the UEs with data waiting, no UE getting more than it can use;
-when fewer blocks than UEs remain, the leftover blocks go round in turn. A UE
-whose reported CQI is 0 is out of coverage and gets nothing.
+**Schedulers.** Each slot the scheduler learns how many PRBs are left after
+retransmissions, how many each UE could fill, and how many bits a PRB carries
+for each UE at its reported CQI, and decides how many PRBs each UE gets (the
+channel is flat, so which ones does not matter). None gives a UE more than it
+can use or leaves a PRB idle while someone could use it, and ties go to UEs in
+turn.
+
+- **Round robin** splits the PRBs equally among the UEs with data waiting,
+  sharing again whatever a UE cannot use; leftover blocks go round in turn.
+- **Max C/I** serves UEs in order of bits per PRB, each as much as it needs.
+- **Proportional fair** serves UEs in order of bits per PRB over their average
+  throughput, an exponentially weighted moving average of the bits received
+  per slot with a time constant of `time_constant_ms`.
+
+A UE whose reported CQI is 0 is out of coverage and gets nothing.
 
 **Randomness.** Every source of randomness has its own
 `numpy.random.Generator`, derived from the scenario seed and the stream's name,
@@ -206,7 +265,7 @@ periods last five frames on average.
 
 - [x] Simulation core: carrier tables, seeded slot engine, traffic models, metrics, YAML scenarios
 - [x] Radio channel and link adaptation (TR 38.901 UMa, CQI per TS 38.214, HARQ)
-- [ ] MAC schedulers: round robin, max C/I, proportional fair; `slicesim compare`
+- [x] MAC schedulers: round robin, max C/I, proportional fair; `slicesim compare`
 - [ ] Network slicing with per-slice SLAs and inter-slice policies
 - [ ] Gymnasium environment for the slice controller
 - [ ] PPO agent written from scratch; `slicesim train` and `slicesim evaluate`

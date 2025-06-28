@@ -1,0 +1,28 @@
+# Twenty full-buffer UEs across a 500 m urban macro cell: the classic setting for
+# comparing schedulers on throughput and fairness. Run it with:
+#   slicesim compare scenarios/fairness.yaml
+name: fairness
+description: twenty full-buffer UEs across a 500 m cell
+seed: 1
+duration_s: 10
+
+carrier:
+  bandwidth_mhz: 20
+  scs_khz: 30
+
+cell:
+  radius_m: 500
+
+channel:
+  fading: rayleigh
+  coherence_ms: 40
+
+scheduler:
+  model: pf
+  time_constant_ms: 100
+
+ues:
+  - name: bulk
+    count: 20
+    traffic:
+      model: full_buffer

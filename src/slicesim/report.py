@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from slicesim.config import AdaptiveLink, FixedLink, Scenario
+from slicesim.config import (
+    AdaptiveLink,
+    FixedLink,
+    MaxCIScheduler,
+    ProportionalFairScheduler,
+    Scenario,
+)
 from slicesim.metrics import RunSummary
 
 MISSING = "-"
@@ -64,12 +70,33 @@ def describe_link(scenario: Scenario) -> list[str]:
     ]
 
 
+def describe_scheduler(scenario: Scenario) -> str:
+    scheduler = scenario.scheduler
+    if isinstance(scheduler, ProportionalFairScheduler):
+        return f"proportional fair ({scheduler.time_constant_ms:g} ms average)"
+    if isinstance(scheduler, MaxCIScheduler):
+        return "max C/I"
+    return "round robin"
+
+
+def _header(title: str, summary: RunSummary, scenario: Scenario) -> list[str]:
+    cell = summary.cell
+    return [
+        title,
+        f"  seed      {summary.seed}",
+        f"  duration  {cell.duration_s:g} s ({cell.n_slots:,} slots)",
+        f"  carrier   {summary.carrier}",
+        *describe_link(scenario),
+    ]
+
+
+def _title(scenario: Scenario) -> str:
+    return f"{scenario.name}: {scenario.description}" if scenario.description else scenario.name
+
+
 def render_summary(summary: RunSummary, scenario: Scenario) -> str:
     """The summary ``slicesim run`` prints."""
     cell = summary.cell
-    title = summary.scenario
-    if scenario.description:
-        title += f": {scenario.description}"
     result = (
         f"  result    {cell.delivered_mbps:,.2f} Mbit/s delivered of "
         f"{cell.peak_mbps:,.1f} peak, {cell.prb_utilization:.1%} of PRBs used"
@@ -78,11 +105,8 @@ def render_summary(summary: RunSummary, scenario: Scenario) -> str:
         assert cell.residual_bler is not None
         result += f", BLER {cell.bler:.1%}, {cell.residual_bler:.2%} of blocks dropped"
     header = [
-        title,
-        f"  seed      {summary.seed}",
-        f"  duration  {cell.duration_s:g} s ({cell.n_slots:,} slots)",
-        f"  carrier   {summary.carrier}",
-        *describe_link(scenario),
+        *_header(_title(scenario), summary, scenario),
+        f"  scheduler {describe_scheduler(scenario)}",
         result,
     ]
     headers = [
@@ -92,6 +116,7 @@ def render_summary(summary: RunSummary, scenario: Scenario) -> str:
         "offered",
         "delivered",
         "per UE",
+        "Jain",
         "SINR",
         "CQI",
         "packets",
@@ -100,7 +125,7 @@ def render_summary(summary: RunSummary, scenario: Scenario) -> str:
         "p50",
         "p95",
         "p99",
-        "queued",
+        "buffer",
     ]
     rows = []
     for g in summary.groups:
@@ -114,6 +139,7 @@ def render_summary(summary: RunSummary, scenario: Scenario) -> str:
                 _number(g.offered_mbps),
                 _number(g.delivered_mbps),
                 _number(g.per_ue_mbps, 3),
+                _number(g.jain, 3),
                 _number(g.mean_sinr_db, 1),
                 _number(g.mean_cqi, 1),
                 f"{g.packets_delivered:,}" if packet_traffic else MISSING,
@@ -122,12 +148,61 @@ def render_summary(summary: RunSummary, scenario: Scenario) -> str:
                 _number(None if delay is None else delay.p50_ms),
                 _number(None if delay is None else delay.p95_ms),
                 _number(None if delay is None else delay.p99_ms),
-                _number(g.backlog_bytes / 1e3 if packet_traffic else None, 1),
+                _number(g.mean_buffer_bytes / 1e3 if packet_traffic else None, 1),
             ]
         )
     legend = (
-        "Throughput in Mbit/s; SINR in dB before fading; packets delivered and lost; "
-        "delay (mean and percentiles) in ms; queued in kB."
+        "Throughput in Mbit/s; Jain's index over the group's UEs; SINR in dB before fading; "
+        "packets delivered and lost; delay (mean and percentiles) in ms; buffer is the "
+        "average queue per UE in kB."
     )
-    table = format_table(headers, rows, "lrl" + "r" * 12)
+    table = format_table(headers, rows, "lrl" + "r" * 13)
+    return "\n".join([*header, "", table, "", legend])
+
+
+def render_comparison(runs: Sequence[tuple[Scenario, RunSummary]]) -> str:
+    """The table ``slicesim compare`` prints: one row per scheduler."""
+    if not runs:
+        raise ValueError("nothing to compare")
+    first_scenario, first = runs[0]
+    header = _header(_title(first_scenario), first, first_scenario)
+    adaptive = isinstance(first_scenario.link, AdaptiveLink)
+    headers = [
+        "scheduler",
+        "delivered",
+        "Jain",
+        "edge UE",
+        "median UE",
+        "delay",
+        "p50",
+        "p95",
+        "p99",
+        "buffer",
+        "BLER",
+    ]
+    rows = []
+    for scenario, summary in runs:
+        cell = summary.cell
+        delay = cell.delay
+        rows.append(
+            [
+                describe_scheduler(scenario),
+                _number(cell.delivered_mbps),
+                _number(cell.jain, 3),
+                _number(cell.edge_mbps, 3),
+                _number(cell.median_ue_mbps, 3),
+                _number(None if delay is None else delay.mean_ms),
+                _number(None if delay is None else delay.p50_ms),
+                _number(None if delay is None else delay.p95_ms),
+                _number(None if delay is None else delay.p99_ms),
+                _number(cell.mean_buffer_bytes / 1e3, 1),
+                f"{cell.bler:.1%}" if adaptive and cell.bler is not None else MISSING,
+            ]
+        )
+    legend = (
+        "Throughput in Mbit/s; Jain's index over every UE's throughput; edge UE is the 5th "
+        "percentile of per-UE throughput; delay over every packet in ms; buffer is the "
+        "average queue per UE in kB. Every scheduler sees the same UEs, channels and traffic."
+    )
+    table = format_table(headers, rows, "l" + "r" * 10)
     return "\n".join([*header, "", table, "", legend])

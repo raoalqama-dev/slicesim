@@ -5,8 +5,8 @@ Each slot:
 1. every UE's SINR is read from the channel, and the scheduler sizes its
    transport blocks from the CQI each UE reported ``cqi_delay_slots`` ago;
 2. HARQ retransmissions that are due take their PRBs first;
-3. the remaining PRBs are shared among the UEs with data waiting, as the
-   queues stand at the start of the slot;
+3. the scheduler shares the remaining PRBs among the UEs with data waiting,
+   as the queues stand at the start of the slot;
 4. each block decodes or fails with the BLER at the SINR it actually meets;
 5. packets of decoded blocks are released to the UE in order;
 6. the packets that arrive during the slot join the queues, to be served
@@ -31,6 +31,7 @@ from slicesim.channel.link import bits_per_prb, bler, cqi_from_sinr
 from slicesim.config import AdaptiveLink, Scenario
 from slicesim.harq import BlockState, DeliveryQueue, Harq, TransportBlock
 from slicesim.metrics import MetricsCollector, SimulationResult
+from slicesim.schedulers import SlotDemand, build_scheduler
 from slicesim.traffic import Arrivals, TrafficSource, build_source
 from slicesim.ue import UEPopulation
 
@@ -57,30 +58,6 @@ class RngStreams:
         return np.random.default_rng(np.random.SeedSequence(self.seed, spawn_key=spawn_key))
 
 
-def share_prbs(need: npt.NDArray[np.int64], n_prb: int, rotation: int) -> npt.NDArray[np.int64]:
-    """Split ``n_prb`` resource blocks equally among the UEs that need any.
-
-    No UE gets more than it needs: what a UE cannot use is shared again among
-    the rest (water-filling). When fewer blocks remain than UEs want them,
-    one block each goes to UEs in turn, starting at a point that moves with
-    ``rotation``, so no UE is favoured over time.
-    """
-    alloc = np.zeros_like(need)
-    remaining = n_prb
-    wanting = np.flatnonzero(need > 0)
-    while remaining > 0 and wanting.size:
-        share = remaining // wanting.size
-        if share == 0:
-            turn = (rotation + np.arange(remaining)) % wanting.size
-            alloc[wanting[turn]] += 1
-            break
-        give = np.minimum(share, need[wanting] - alloc[wanting])
-        alloc[wanting] += give
-        remaining -= int(give.sum())
-        wanting = wanting[alloc[wanting] < need[wanting]]
-    return alloc
-
-
 class Simulation:
     """A scenario being simulated, one slot at a time."""
 
@@ -100,6 +77,9 @@ class Simulation:
         counts = np.array([group.count for group in scenario.ues])
         self._group_start = (np.cumsum(counts) - counts).tolist()
         self.metrics = MetricsCollector(self.ues.size, self.n_slots)
+        self.scheduler = build_scheduler(
+            scenario.scheduler, self.ues.size, self.carrier.slot_duration_s
+        )
         self.delivery = [None if b is None else DeliveryQueue() for b in self.ues.buffers]
 
         link = scenario.link
@@ -190,6 +170,7 @@ class Simulation:
             los=None if channel is None else channel.los.copy(),
             mean_sinr_db=None if channel is None else channel.mean_sinr_db.copy(),
             mean_cqi=None if channel is None else m.cqi_sum / max(self.slot, 1),
+            mean_buffer_bytes=m.backlog_sum / max(self.slot, 1),
         )
 
     def _link_state(
@@ -256,12 +237,15 @@ class Simulation:
             retx_prbs = self._retransmit(self.harq, sinr, delivered, resolved)
         free = self.carrier.n_prb - retx_prbs
 
+        m.backlog_sum += self.ues.backlog_bytes
         # New data shares what is left; a UE out of coverage (CQI 0) gets nothing.
         reachable = bits > 0
         need = np.zeros(self.ues.size, dtype=np.int64)
         need[reachable] = -(-self.ues.backlog_bytes[reachable] * 8 // bits[reachable])
         need[self.ues.full_buffer & reachable] = free
-        prbs = share_prbs(np.minimum(need, free), free, slot)
+        prbs = self.scheduler.allocate(
+            SlotDemand(slot=slot, n_prb=free, need=np.minimum(need, free), bits_per_prb=bits)
+        )
         scheduled = np.flatnonzero(prbs)
         if sinr is None or cqi is None:
             decoded = np.ones(scheduled.size, dtype=np.bool_)
@@ -321,6 +305,7 @@ class Simulation:
                 m.packets_lost[i] += queue.release(t1, delays)
                 delay_ue.extend([i] * (len(delays) - before))
 
+        self.scheduler.delivered(delivered * 8)
         m.record_slot(slot, retx_prbs + int(prbs.sum()), delivered)
         m.record_delays(np.asarray(delay_ue, dtype=np.intp), np.asarray(delays, dtype=np.float64))
 

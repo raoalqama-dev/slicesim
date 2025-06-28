@@ -12,6 +12,7 @@ from slicesim.config import (
     FixedLink,
     OnOffTraffic,
     PoissonTraffic,
+    RoundRobinScheduler,
     ScenarioError,
     load_scenario,
     parse_scenario,
@@ -59,6 +60,12 @@ def test_the_radio_channel_is_the_default() -> None:
         interference_margin_db=3,
     )
     assert s.channel == ChannelConfig(shadowing=True, fading="rayleigh", coherence_ms=40)
+    assert s.scheduler == RoundRobinScheduler()
+
+
+def test_a_ring_of_ues_is_allowed() -> None:
+    s = scenario(cell={"radius_m": 15, "min_distance_m": 15})
+    assert s.cell.radius_m == s.cell.min_distance_m == 15
 
 
 def test_the_fixed_link_takes_a_rate() -> None:
@@ -140,11 +147,23 @@ def test_duration_becomes_whole_slots(duration_s: float, scs: int, slots: int) -
         ),
         (
             {"cell": {"radius_m": 30}},
-            "cell: radius_m must be larger than min_distance_m",
+            "cell: radius_m must be at least min_distance_m",
         ),
         (
             {"cell": {"ue_height_m": 20}},
             "cell.ue_height_m: Input should be less than or equal to 13 (got 20)",
+        ),
+        (
+            {"scheduler": {"model": "edf"}},
+            "scheduler: unknown 'model' 'edf'; expected one of 'rr', 'maxci', 'pf'",
+        ),
+        (
+            {"scheduler": {"model": "pf", "time_constant_ms": 0}},
+            "scheduler.time_constant_ms: Input should be greater than 0 (got 0)",
+        ),
+        (
+            {"scheduler": {"model": "rr", "time_constant_ms": 50}},
+            "scheduler.time_constant_ms: unknown field",
         ),
         (
             {"channel": {"fading": "jakes"}},

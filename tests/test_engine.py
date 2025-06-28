@@ -8,7 +8,7 @@ import pytest
 
 from factories import poisson_group, scenario
 from slicesim.config import Scenario
-from slicesim.engine import RngStreams, Simulation, share_prbs, simulate
+from slicesim.engine import RngStreams, Simulation, simulate
 from slicesim.harq import TransportBlock
 from slicesim.metrics import SimulationResult
 from slicesim.traffic import Periodic
@@ -47,48 +47,6 @@ class TestRngStreams:
     def test_negative_seeds_are_rejected(self) -> None:
         with pytest.raises(ValueError, match="non-negative"):
             RngStreams(-1)
-
-
-class TestSharePrbs:
-    def test_equal_needs_share_equally(self) -> None:
-        alloc = share_prbs(np.array([100, 100, 100, 100]), 52, 0)
-        assert alloc.tolist() == [13, 13, 13, 13]
-
-    def test_what_a_ue_cannot_use_goes_to_the_others(self) -> None:
-        alloc = share_prbs(np.array([2, 100, 5, 100]), 51, 0)
-        assert alloc.tolist() == [2, 22, 5, 22]
-
-    def test_nobody_gets_more_than_it_needs(self) -> None:
-        need = np.array([3, 0, 1, 4])
-        alloc = share_prbs(need, 51, 0)
-        assert alloc.tolist() == need.tolist()
-
-    def test_remainder_blocks_rotate_between_ues(self) -> None:
-        need = np.array([50, 50, 50])
-        total = np.sum([share_prbs(need, 10, slot) for slot in range(3)], axis=0)
-        assert total.tolist() == [10, 10, 10]
-        assert share_prbs(need, 10, 0).sum() == 10
-
-    def test_more_ues_than_blocks(self) -> None:
-        need = np.ones(7, dtype=np.int64)
-        assert share_prbs(need, 3, 0).tolist() == [1, 1, 1, 0, 0, 0, 0]
-        assert share_prbs(need, 3, 5).tolist() == [1, 0, 0, 0, 0, 1, 1]
-
-    def test_no_demand_allocates_nothing(self) -> None:
-        assert share_prbs(np.zeros(3, dtype=np.int64), 51, 0).tolist() == [0, 0, 0]
-
-    @pytest.mark.parametrize("seed", range(20))
-    def test_allocation_invariants(self, seed: int) -> None:
-        gen = np.random.default_rng(seed)
-        need = gen.integers(0, 30, size=gen.integers(1, 40))
-        n_prb = int(gen.integers(1, 120))
-        alloc = share_prbs(need, n_prb, int(gen.integers(0, 1000)))
-        assert np.all(alloc <= need)
-        assert alloc.sum() == min(n_prb, need.sum())
-        # Max-min fair: a UE that got less than it needs got at least as much as anyone.
-        short = alloc < need
-        if short.any():
-            assert np.min(alloc[short]) >= np.max(alloc) - 1
 
 
 class TestDeterminism:

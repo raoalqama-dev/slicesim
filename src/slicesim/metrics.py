@@ -37,6 +37,8 @@ class MetricsCollector:
         self.dropped_bytes = np.zeros(n_ues, dtype=np.int64)
         self.cqi_sum = np.zeros(n_ues, dtype=np.int64)
         """Sum of each UE's reported CQI over the slots so far."""
+        self.backlog_sum = np.zeros(n_ues, dtype=np.int64)
+        """Sum of each UE's queued bytes at the start of every slot so far."""
         self.prb_used = np.zeros(n_slots, dtype=np.int32)
         self._delay_ue: list[npt.NDArray[np.intp]] = []
         self._delay_s: list[npt.NDArray[np.float64]] = []
@@ -63,6 +65,16 @@ class MetricsCollector:
         if not self._delay_ue:
             return np.empty(0, dtype=np.intp), np.empty(0, dtype=np.float64)
         return np.concatenate(self._delay_ue), np.concatenate(self._delay_s)
+
+
+def jain_index(values: npt.ArrayLike) -> float | None:
+    """Jain's fairness index (sum x)^2 / (n sum x^2): 1 when all are equal, 1/n when
+    one value takes everything. None when every value is zero."""
+    x = np.asarray(values, dtype=np.float64)
+    squares = float((x**2).sum())
+    if x.size == 0 or squares == 0:
+        return None
+    return float(x.sum() ** 2 / (x.size * squares))
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,8 @@ class GroupSummary:
     """Offered load measured from arrivals; None for full-buffer traffic."""
     delivered_mbps: float
     per_ue_mbps: float
+    jain: float | None
+    """Jain's index over the group's per-UE throughputs."""
     mean_sinr_db: float | None
     """Mean over the group's UEs of their SINR before fading; None for the fixed link."""
     mean_cqi: float | None
@@ -108,6 +122,8 @@ class GroupSummary:
     delay: DelayStats | None
     backlog_bytes: int
     """Bytes still queued at the end of the run."""
+    mean_buffer_bytes: float
+    """Time-average queued bytes per UE, measured at the start of each slot."""
 
 
 @dataclass(frozen=True)
@@ -125,6 +141,15 @@ class CellSummary:
     residual_bler: float | None
     """Share of transport blocks dropped after every HARQ transmission failed."""
     retransmissions: int
+    jain: float | None
+    """Jain's index over every UE's throughput; meaningful when UEs have alike traffic."""
+    edge_mbps: float
+    """5th percentile of per-UE throughput."""
+    median_ue_mbps: float
+    delay: DelayStats | None
+    """Delay over every delivered packet."""
+    mean_buffer_bytes: float
+    """Time-average queued bytes per UE."""
 
 
 @dataclass(frozen=True)
@@ -174,6 +199,8 @@ class SimulationResult:
     mean_sinr_db: npt.NDArray[np.float64] | None
     """Each UE's SINR before fading."""
     mean_cqi: npt.NDArray[np.float64] | None
+    mean_buffer_bytes: npt.NDArray[np.float64]
+    """Each UE's time-average queued bytes."""
 
     @property
     def duration_s(self) -> float:
@@ -212,6 +239,7 @@ class SimulationResult:
                     ),
                     delivered_mbps=delivered_bits / duration / 1e6,
                     per_ue_mbps=delivered_bits / duration / 1e6 / int(members.sum()),
+                    jain=jain_index(self.delivered_bytes[members]),
                     mean_sinr_db=(
                         None
                         if self.mean_sinr_db is None
@@ -225,9 +253,11 @@ class SimulationResult:
                     packets_lost=int(self.packets_lost[members].sum()),
                     delay=DelayStats.of(self.delay_s[members[self.delay_ue]]),
                     backlog_bytes=int(self.backlog_bytes[members].sum()),
+                    mean_buffer_bytes=float(self.mean_buffer_bytes[members].mean()),
                 )
             )
         sent = int(self.blocks_sent.sum())
+        throughput = self.throughput_bps()
         cell = CellSummary(
             duration_s=duration,
             n_slots=self.n_slots,
@@ -237,6 +267,11 @@ class SimulationResult:
             bler=_ratio(int(self.blocks_failed.sum()), sent),
             residual_bler=_ratio(int(self.blocks_dropped.sum()), sent),
             retransmissions=int(self.retransmissions.sum()),
+            jain=jain_index(self.delivered_bytes),
+            edge_mbps=float(np.percentile(throughput, 5)) / 1e6,
+            median_ue_mbps=float(np.median(throughput)) / 1e6,
+            delay=DelayStats.of(self.delay_s),
+            mean_buffer_bytes=float(self.mean_buffer_bytes.mean()),
         )
         return RunSummary(
             scenario=self.scenario.name,
