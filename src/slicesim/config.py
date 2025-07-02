@@ -1,9 +1,10 @@
 """Scenario files: pydantic models and YAML loading.
 
 A scenario describes one simulation completely: the carrier, the cell and
-its radio channel, the link model, the scheduler, the UEs and their traffic,
-how long to run and the seed. Unknown keys are rejected, so a misspelt option
-fails loudly instead of being ignored.
+its radio channel, the link model, the scheduler or the slices and how they
+share the cell, the UEs and their traffic, how long to run and the seed.
+Unknown keys are rejected, so a misspelt option fails loudly instead of being
+ignored.
 """
 
 from __future__ import annotations
@@ -69,6 +70,9 @@ class ChannelConfig(_Model):
     shadowing: bool = True
     fading: Literal["rayleigh", "none"] = "rayleigh"
     coherence_ms: float = Field(default=40.0, gt=0, le=10_000)
+    diversity: int = Field(
+        default=1, ge=1, le=16, description="independent fading branches combined at the UE"
+    )
 
 
 class AdaptiveLink(_Model):
@@ -154,12 +158,68 @@ TrafficConfig = Annotated[
 ]
 
 
-class UEGroup(_Model):
-    """A number of UEs sharing one traffic model."""
+_NAME = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_.-]+$")
 
-    name: str = Field(min_length=1, max_length=32, pattern=r"^[A-Za-z0-9_.-]+$")
+
+class UEGroup(_Model):
+    """A number of UEs sharing one traffic model, in one slice if the cell is sliced."""
+
+    name: str = _NAME
     count: int = Field(gt=0, le=100_000)
     traffic: TrafficConfig
+    slice: str | None = None
+
+
+class EmbbSla(_Model):
+    """Enhanced mobile broadband: a minimum throughput per UE."""
+
+    type: Literal["embb"]
+    min_throughput_mbps: float = Field(gt=0, le=10_000)
+    availability: float = Field(
+        default=0.95, gt=0, le=1, description="share of UE-windows that must get the minimum"
+    )
+
+
+class UrllcSla(_Model):
+    """Ultra-reliable low latency: a share of packets delivered within a delay budget."""
+
+    type: Literal["urllc"]
+    delay_budget_ms: float = Field(default=5.0, gt=0, le=10_000)
+    reliability: float = Field(default=0.999, gt=0, lt=1)
+
+
+class MmtcSla(_Model):
+    """Massive machine-type: many devices, a loose deadline on their small packets."""
+
+    type: Literal["mmtc"]
+    delay_budget_ms: float = Field(default=1000.0, gt=0, le=100_000)
+    reliability: float = Field(default=0.99, gt=0, lt=1)
+
+
+SlaConfig = Annotated[EmbbSla | UrllcSla | MmtcSla, Field(discriminator="type")]
+
+
+class SliceConfig(_Model):
+    """A network slice: its service level agreement and its own scheduler."""
+
+    name: str = _NAME
+    sla: SlaConfig
+    scheduler: SchedulerConfig = RoundRobinScheduler()
+    quota: float | None = Field(
+        default=None, gt=0, le=1, description="share of the PRBs under the static policy"
+    )
+    cqi_backoff_db: float = Field(
+        default=0.0, ge=0, le=20, description="SINR margin the slice's CQI choice keeps"
+    )
+
+
+class SlicingConfig(_Model):
+    """How the PRBs are split between slices, and how SLAs are measured."""
+
+    policy: Literal["static", "delay_aware", "proportional"] = "delay_aware"
+    window_ms: float = Field(
+        default=100.0, gt=0, le=60_000, description="window for eMBB throughput"
+    )
 
 
 class Scenario(_Model):
@@ -174,14 +234,21 @@ class Scenario(_Model):
     channel: ChannelConfig = ChannelConfig()
     link: LinkConfig = AdaptiveLink()
     scheduler: SchedulerConfig = RoundRobinScheduler()
+    slices: list[SliceConfig] = Field(default_factory=list)
+    slicing: SlicingConfig | None = None
     ues: list[UEGroup] = Field(min_length=1)
 
     @model_validator(mode="after")
     def _check(self) -> Scenario:
-        names = [g.name for g in self.ues]
-        duplicates = sorted({n for n in names if names.count(n) > 1})
-        if duplicates:
-            raise ValueError(f"UE group names must be unique; repeated: {', '.join(duplicates)}")
+        _unique("UE group", [g.name for g in self.ues])
+        if self.slices:
+            self._check_slices()
+        else:
+            if self.slicing is not None:
+                raise ValueError("slicing needs slices")
+            sliced = [g.name for g in self.ues if g.slice is not None]
+            if sliced:
+                raise ValueError(f"UE groups name slices but none are defined: {', '.join(sliced)}")
         slot_s = self.carrier.build().slot_duration_s
         if self.duration_s < slot_s:
             raise ValueError(
@@ -189,6 +256,38 @@ class Scenario(_Model):
                 f"{self.carrier.scs_khz} kHz)"
             )
         return self
+
+    def _check_slices(self) -> None:
+        names = [s.name for s in self.slices]
+        _unique("slice", names)
+        if "scheduler" in self.model_fields_set:
+            raise ValueError("a sliced cell sets a scheduler in each slice, not at the top level")
+        for group in self.ues:
+            if group.slice is None:
+                raise ValueError(f"UE group {group.name} must name its slice")
+            if group.slice not in names:
+                raise ValueError(
+                    f"UE group {group.name} names slice {group.slice!r}, which is not defined; "
+                    f"slices are {', '.join(names)}"
+                )
+        empty = [n for n in names if not any(g.slice == n for g in self.ues)]
+        if empty:
+            raise ValueError(f"slices without UEs: {', '.join(empty)}")
+        if self.slicing_config.policy == "static":
+            missing = [s.name for s in self.slices if s.quota is None]
+            if missing:
+                raise ValueError(
+                    f"the static policy needs a quota for every slice; missing: "
+                    f"{', '.join(missing)}"
+                )
+            total = sum(s.quota or 0.0 for s in self.slices)
+            if total > 1 + 1e-9:
+                raise ValueError(f"slice quotas add up to {total:g}, more than 1")
+
+    @property
+    def slicing_config(self) -> SlicingConfig:
+        """The slicing settings, defaults included."""
+        return self.slicing or SlicingConfig()
 
     @property
     def n_slots(self) -> int:
@@ -202,7 +301,13 @@ class Scenario(_Model):
 
         Raises ScenarioError if the result is invalid.
         """
-        return parse_scenario({**self.model_dump(), **changes})
+        return parse_scenario({**self.model_dump(exclude_unset=True), **changes})
+
+
+def _unique(what: str, names: list[str]) -> None:
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise ValueError(f"{what} names must be unique; repeated: {', '.join(duplicates)}")
 
 
 class ScenarioError(Exception):
@@ -215,8 +320,8 @@ class ScenarioError(Exception):
         super().__init__(f"{source}: invalid scenario\n{detail}")
 
 
-def _tags(*models: type[BaseModel]) -> frozenset[str]:
-    return frozenset(get_args(m.model_fields["model"].annotation)[0] for m in models)
+def _tags(*models: type[BaseModel], field: str = "model") -> frozenset[str]:
+    return frozenset(get_args(m.model_fields[field].annotation)[0] for m in models)
 
 
 # The tags of each discriminated union, keyed by the field holding it.
@@ -224,6 +329,7 @@ _UNION_TAGS = {
     "traffic": _tags(FullBufferTraffic, PoissonTraffic, PeriodicTraffic, OnOffTraffic),
     "link": _tags(AdaptiveLink, FixedLink),
     "scheduler": _tags(RoundRobinScheduler, MaxCIScheduler, ProportionalFairScheduler),
+    "sla": _tags(EmbbSla, UrllcSla, MmtcSla, field="type"),
 }
 
 

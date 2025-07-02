@@ -118,7 +118,7 @@ class RadioChannel:
                 else np.zeros(count)
             )
             fading: BlockFading | NoFading = (
-                BlockFading(count, coherence_slots, rngs.fading)
+                BlockFading(count, coherence_slots, rngs.fading, channel.diversity)
                 if channel.fading == "rayleigh"
                 else NoFading(count)
             )

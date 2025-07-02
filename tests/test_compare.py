@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -96,3 +97,27 @@ def test_with_scheduler_keeps_the_scenarios_own_settings() -> None:
     assert with_scheduler(scenario(), "pf").scheduler == ProportionalFairScheduler()
     with pytest.raises(ValueError, match="unknown scheduler 'edf'"):
         with_scheduler(s, "edf")
+
+
+def test_with_scheduler_sets_every_slice() -> None:
+    from slicesim.config import load_scenario
+
+    medium = load_scenario(Path(__file__).resolve().parent.parent / "scenarios" / "medium.yaml")
+    rr = with_scheduler(medium, "rr")
+    assert [s.scheduler.model for s in rr.slices] == ["rr", "rr", "rr"]
+    pf = with_scheduler(medium, "pf")
+    # The eMBB slice keeps its own proportional fair settings.
+    assert pf.slices[0].scheduler == medium.slices[0].scheduler
+    assert [s.scheduler.model for s in pf.slices] == ["pf", "pf", "pf"]
+    assert with_scheduler(pf, "pf") is pf
+    assert pf.slices[0].quota == medium.slices[0].quota
+
+
+def test_with_policy_keeps_the_other_slicing_settings() -> None:
+    from slicesim.compare import with_policy
+    from slicesim.config import load_scenario
+
+    medium = load_scenario(Path(__file__).resolve().parent.parent / "scenarios" / "medium.yaml")
+    static = with_policy(medium, "static")
+    assert static.slicing_config.policy == "static"
+    assert static.slicing_config.window_ms == medium.slicing_config.window_ms

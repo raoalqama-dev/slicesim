@@ -51,3 +51,28 @@ def test_no_fading_is_flat() -> None:
     gains = run(NoFading(3), 5)
     assert gains.shape == (5, 3)
     assert np.all(gains == 0.0)
+
+
+def test_diversity_keeps_the_mean_and_shrinks_deep_fades() -> None:
+    def gains(diversity: int) -> np.ndarray:
+        fading = BlockFading(400, 1, np.random.default_rng(5), diversity)
+        return 10 ** (run(fading, 250) / 10)
+
+    one, two, four = gains(1), gains(2), gains(4)
+    for g in (one, two, four):
+        assert g.mean() == pytest.approx(1.0, abs=0.01)
+    # Below -10 dB: 9.5% of the time with one branch, 1.8% with two, 0.08% with four.
+    assert (one < 0.1).mean() == pytest.approx(0.0952, abs=0.003)
+    assert (two < 0.1).mean() == pytest.approx(0.0175, abs=0.002)
+    assert (four < 0.1).mean() == pytest.approx(0.00078, abs=0.0003)
+    # Gamma(N, 1/N): the variance falls as 1/N.
+    assert two.var() == pytest.approx(0.5, abs=0.02)
+    assert four.var() == pytest.approx(0.25, abs=0.01)
+
+
+def test_one_branch_is_plain_rayleigh() -> None:
+    a = run(BlockFading(10, 3, np.random.default_rng(6)), 20)
+    b = run(BlockFading(10, 3, np.random.default_rng(6), diversity=1), 20)
+    assert np.array_equal(a, b)
+    with pytest.raises(ValueError, match="diversity"):
+        BlockFading(1, 1, np.random.default_rng(6), diversity=0)

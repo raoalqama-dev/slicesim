@@ -43,6 +43,15 @@ class PacketBuffer:
             self._sizes.append(size)
             self.backlog_bytes += size
 
+    def waiting_since(self, time: float) -> int:
+        """How many queued packets arrived before ``time``."""
+        count = 0
+        for arrival in self._arrivals:
+            if arrival >= time:
+                break
+            count += 1
+        return count
+
     @property
     def head_started(self) -> bool:
         """Whether part of the head packet has already been sent."""

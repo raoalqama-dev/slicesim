@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -11,6 +11,9 @@ import numpy.typing as npt
 from slicesim.carrier import Carrier
 from slicesim.channel.link import bits_per_prb
 from slicesim.config import AdaptiveLink, Scenario
+
+if TYPE_CHECKING:
+    from slicesim.slicing.sla import SliceSummary
 
 DELAY_PERCENTILES = (50.0, 95.0, 99.0)
 
@@ -20,8 +23,12 @@ IntArray = npt.NDArray[np.int64]
 class MetricsCollector:
     """Per-UE counters and per-packet delays, filled in slot by slot."""
 
-    def __init__(self, n_ues: int, n_slots: int) -> None:
+    def __init__(
+        self, n_ues: int, n_slots: int, n_slices: int = 1, window_slots: int | None = None
+    ) -> None:
         self.n_ues = n_ues
+        self.window_slots = window_slots or max(n_slots, 1)
+        n_windows = -(-n_slots // self.window_slots)
         self.offered_bytes = np.zeros(n_ues, dtype=np.int64)
         self.packets_arrived = np.zeros(n_ues, dtype=np.int64)
         self.delivered_bytes = np.zeros(n_ues, dtype=np.int64)
@@ -40,18 +47,31 @@ class MetricsCollector:
         self.backlog_sum = np.zeros(n_ues, dtype=np.int64)
         """Sum of each UE's queued bytes at the start of every slot so far."""
         self.prb_used = np.zeros(n_slots, dtype=np.int32)
+        self.slice_prbs = np.zeros((n_slots, n_slices), dtype=np.int32)
+        """PRBs each slice used in each slot, retransmissions included."""
+        self.window_delivered = np.zeros((n_windows, n_ues), dtype=np.int64)
+        self.window_offered = np.zeros((n_windows, n_ues), dtype=np.int64)
+        self.window_backlog = np.zeros((n_windows, n_ues), dtype=np.int64)
+        """Bytes queued for each UE at the start of each SLA window."""
         self._delay_ue: list[npt.NDArray[np.intp]] = []
         self._delay_s: list[npt.NDArray[np.float64]] = []
 
-    def record_arrivals(self, ue: npt.NDArray[np.intp], size: IntArray) -> None:
-        """Count packets arriving at the gNB, one entry per packet."""
-        self.offered_bytes += np.bincount(ue, weights=size, minlength=self.n_ues).astype(np.int64)
+    def record_arrivals(self, ue: npt.NDArray[np.intp], size: IntArray, slot: int = 0) -> None:
+        """Count packets arriving at the gNB during ``slot``, one entry per packet."""
+        offered = np.bincount(ue, weights=size, minlength=self.n_ues).astype(np.int64)
+        self.offered_bytes += offered
+        self.window_offered[slot // self.window_slots] += offered
         self.packets_arrived += np.bincount(ue, minlength=self.n_ues)
+
+    def start_window(self, slot: int, backlog_bytes: IntArray) -> None:
+        """Note what is queued as the SLA window starting at ``slot`` opens."""
+        self.window_backlog[slot // self.window_slots] = backlog_bytes
 
     def record_slot(self, slot: int, prbs_used: int, delivered: IntArray) -> None:
         """Record how many PRBs a slot used and the bytes it delivered to each UE."""
         self.prb_used[slot] = prbs_used
         self.delivered_bytes += delivered
+        self.window_delivered[slot // self.window_slots] += delivered
 
     def record_delays(self, ue: npt.NDArray[np.intp], delay_s: npt.NDArray[np.float64]) -> None:
         """Record delivered packets, each with the delay from arrival to delivery."""
@@ -159,6 +179,8 @@ class RunSummary:
     carrier: str
     cell: CellSummary
     groups: list[GroupSummary]
+    slices: list[SliceSummary]
+    """Empty for an unsliced cell."""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -201,6 +223,15 @@ class SimulationResult:
     mean_cqi: npt.NDArray[np.float64] | None
     mean_buffer_bytes: npt.NDArray[np.float64]
     """Each UE's time-average queued bytes."""
+    ue_slice: npt.NDArray[np.intp]
+    slice_prbs: npt.NDArray[np.int32]
+    """PRBs each slice used in each slot."""
+    window_slots: int
+    window_delivered: IntArray
+    window_offered: IntArray
+    window_backlog: IntArray
+    overdue_packets: IntArray
+    """Packets still queued at the end that had already waited past their slice's budget."""
 
     @property
     def duration_s(self) -> float:
@@ -273,10 +304,14 @@ class SimulationResult:
             delay=DelayStats.of(self.delay_s),
             mean_buffer_bytes=float(self.mean_buffer_bytes.mean()),
         )
+        # Imported here: slice accounting builds on this module's DelayStats.
+        from slicesim.slicing.sla import summarize_slices
+
         return RunSummary(
             scenario=self.scenario.name,
             seed=self.scenario.seed,
             carrier=str(self.carrier),
             cell=cell,
             groups=groups,
+            slices=summarize_slices(self),
         )

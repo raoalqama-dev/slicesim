@@ -10,6 +10,7 @@ from slicesim.config import (
     MaxCIScheduler,
     ProportionalFairScheduler,
     Scenario,
+    SchedulerConfig,
 )
 from slicesim.metrics import RunSummary
 
@@ -70,13 +71,81 @@ def describe_link(scenario: Scenario) -> list[str]:
     ]
 
 
-def describe_scheduler(scenario: Scenario) -> str:
-    scheduler = scenario.scheduler
+def _scheduler_name(scheduler: SchedulerConfig) -> str:
     if isinstance(scheduler, ProportionalFairScheduler):
         return f"proportional fair ({scheduler.time_constant_ms:g} ms average)"
     if isinstance(scheduler, MaxCIScheduler):
         return "max C/I"
     return "round robin"
+
+
+def describe_scheduler(scenario: Scenario) -> str:
+    """The scheduler, or each slice's scheduler in a sliced cell."""
+    if scenario.slices:
+        return "; ".join(f"{s.name} {_scheduler_name(s.scheduler)}" for s in scenario.slices)
+    return _scheduler_name(scenario.scheduler)
+
+
+POLICY_NAMES = {
+    "static": "static quotas",
+    "delay_aware": "delay-aware",
+    "proportional": "proportional to demand",
+}
+
+
+def _percent(value: float | None, digits: int = 2) -> str:
+    return MISSING if value is None else f"{value:.{digits}%}"
+
+
+def render_slices(summary: RunSummary, scenario: Scenario) -> list[str]:
+    """The slice lines of ``slicesim run``: the policy and one row per slice."""
+    if not summary.slices:
+        return []
+    slicing = scenario.slicing_config
+    policy = f"  slicing   {POLICY_NAMES[slicing.policy]} policy"
+    if slicing.policy == "static":
+        quotas = ", ".join(f"{s.name} {s.quota:.0%}" for s in scenario.slices if s.quota)
+        policy += f" ({quotas})"
+    headers = [
+        "slice",
+        "UEs",
+        "PRBs",
+        "delivered",
+        "p50",
+        "p95",
+        "p99",
+        "lost",
+        "violations",
+        "satisfied",
+        "SLA met",
+        "target",
+    ]
+    rows = []
+    for s in summary.slices:
+        delay = s.delay
+        rows.append(
+            [
+                s.name,
+                f"{s.ues:,}",
+                f"{s.prb_share:.1%}",
+                _number(s.delivered_mbps),
+                _number(None if delay is None else delay.p50_ms),
+                _number(None if delay is None else delay.p95_ms),
+                _number(None if delay is None else delay.p99_ms),
+                f"{s.packets_lost:,}",
+                _percent(s.violation_ratio),
+                _percent(s.satisfaction, 1),
+                MISSING if s.met is None else ("yes" if s.met else "NO"),
+                f"{s.sla}: {s.target}",
+            ]
+        )
+    legend = (
+        "PRBs is the slice's share of the carrier; delay percentiles in ms. Violations are "
+        "packets late or lost for URLLC and mMTC, and UE-windows short of the minimum rate "
+        "for eMBB; satisfied is the share on time, or the mean share of the owed rate."
+    )
+    table = format_table(headers, rows, "l" + "r" * 10 + "l")
+    return [policy, "", table, "", legend]
 
 
 def _header(title: str, summary: RunSummary, scenario: Scenario) -> list[str]:
@@ -109,6 +178,9 @@ def render_summary(summary: RunSummary, scenario: Scenario) -> str:
         f"  scheduler {describe_scheduler(scenario)}",
         result,
     ]
+    slices = render_slices(summary, scenario)
+    if slices:
+        header = [*header, *slices]
     headers = [
         "group",
         "UEs",

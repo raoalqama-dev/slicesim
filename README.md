@@ -14,9 +14,11 @@ over a TR 38.901 urban macro cell, with path loss, shadowing and Rayleigh block
 fading. Transport blocks are sized from the CQI each UE reports (TS 38.214),
 fail with a BLER that depends on the SINR they meet, and are retransmitted by
 HARQ. Round robin, max C/I and proportional fair schedulers share the PRBs, and
-`slicesim compare` runs a scenario under each of them. Four traffic models,
-per-packet delay and loss, and validated scenario files complete the core.
-Network slicing is next on the [roadmap](#roadmap).
+`slicesim compare` runs a scenario under each of them. The cell can be split
+into eMBB, URLLC and mMTC slices, each with its own SLA and scheduler, under a
+static, delay-aware or demand-proportional policy, with SLA accounting per
+slice. The Gymnasium environment for a learned slice controller is next on the
+[roadmap](#roadmap).
 
 ## Quick start
 
@@ -102,6 +104,85 @@ What the table shows:
   the 99th percentile delay over every packet is 8.6 ms under PF, 18.5 ms under
   RR and over a second under max C/I.
 
+## Network slicing
+
+`scenarios/low.yaml`, `medium.yaml` and `high.yaml` split the cell into three
+slices: eMBB video in bursts (8, 16 or 24 UEs), URLLC control traffic (10 UEs,
+200 bytes every 5 ms each) and mMTC sensors (100 UEs, one small packet a second
+each). Each slice has an SLA and its own scheduler:
+
+| Slice | SLA | Scheduler | Static quota |
+| ----- | --- | --------- | -----------: |
+| eMBB | 2 Mbit/s per UE in 95% of 100 ms windows | proportional fair | 80% |
+| URLLC | 99.9% of packets within 5 ms | round robin | 15% |
+| mMTC | 99% of packets within 1 s | round robin | 5% |
+
+```text
+$ slicesim run scenarios/medium.yaml --policy static
+  ...
+  slicing   static quotas policy (embb 80%, urllc 15%, mmtc 5%)
+
+slice  UEs   PRBs  delivered   p50   p95    p99  lost  violations  satisfied  SLA met  target
+-----  ---  -----  ---------  ----  ----  -----  ----  ----------  ---------  -------  -----------------------------------------------
+embb    16  47.0%      29.22  3.46  9.99  14.38     4       0.49%      99.9%      yes  embb: 2 Mbit/s per UE in 0.95 of 100 ms windows
+urllc   10   5.8%       3.20  0.90  1.37   4.87     2       0.52%      99.5%       NO  urllc: 0.999 of packets within 5 ms
+mmtc   100   0.2%       0.08  0.81  1.99   5.29     0       0.00%     100.0%      yes  mmtc: 0.99 of packets within 1000 ms
+```
+
+The policies decide how many PRBs each slice gets for new data every slot;
+HARQ retransmissions go first and count against their own slice:
+
+- **Static quotas** give each slice a fixed share of the carrier, sized here
+  from each slice's average load with some headroom. A slice that does not use
+  its share leaves it idle: isolation is what static slicing buys, and idle
+  PRBs are its price.
+- **Delay-aware** serves slices in order of their delay budget, tightest
+  first (URLLC, then mMTC, then eMBB), each up to what its UEs can use.
+- **Proportional** splits the PRBs in proportion to how many each slice could
+  use, blind to delay.
+
+Every load and policy, 10 s each with seed 1:
+
+| Load | Policy | Cell Mbit/s | eMBB windows short | eMBB SLA | URLLC late or lost | URLLC SLA | mMTC SLA |
+| ---- | ------ | ----------: | -----------------: | -------- | -----------------: | --------- | -------- |
+| low | static | 19.0 | 0.18% | met | 0.44% | **missed** | met |
+| low | proportional | 19.0 | 0.00% | met | 0.17% | **missed** | met |
+| low | delay-aware | 19.0 | 0.18% | met | 0.04% | met | met |
+| medium | static | 32.5 | 0.49% | met | 0.52% | **missed** | met |
+| medium | proportional | 32.5 | 0.39% | met | 0.25% | **missed** | met |
+| medium | delay-aware | 32.5 | 0.39% | met | 0.05% | met | met |
+| high | static | 49.3 | 8.06% | **missed** | 0.48% | **missed** | met |
+| high | proportional | 49.5 | 6.30% | **missed** | 0.48% | **missed** | met |
+| high | delay-aware | 49.5 | 6.48% | **missed** | 0.05% | met | met |
+
+- **Static quotas miss the URLLC SLA at every load.** URLLC's 15% is 8 PRBs,
+  plenty on average but not when several control packets arrive together or a
+  UE in a fade needs more PRBs per packet: 18% of URLLC packets wait more than
+  a slot, against 2% under delay-aware. A packet that waits a slot and then
+  needs a HARQ retransmission lands at 5.1 to 5.4 ms, just past the budget.
+  A test pins this on `medium.yaml`: static misses the URLLC SLA, delay-aware
+  meets it.
+- **Proportional gets worse for URLLC as video grows** (0.17%, 0.25%, 0.48%):
+  a burst of video data takes a burst of PRBs, and URLLC's share shrinks with
+  it.
+- **Delay-aware meets URLLC everywhere and costs eMBB almost nothing,** because
+  URLLC is small: 6% of the PRBs. Static costs eMBB the most at high load, where
+  PRBs reserved for the other slices sit idle while video is short (8.06% of
+  windows short, against 6.48%).
+- **At high load no policy saves eMBB.** Twenty-four video UEs offer about as
+  much as the cell carries, so a better split cannot meet every minimum, only
+  decide who falls short. That trade-off is what the learned controller will be
+  asked to make.
+
+Two radio settings matter for URLLC. Its reliability target is beyond a
+single-antenna Rayleigh channel: a mid-SINR UE regularly fades 10 dB below its
+mean for a whole coherence time, and no policy can serve it then. The slicing
+scenarios therefore give UEs two receive antennas (`channel.diversity: 2`, the
+minimum for an NR FR1 device), which makes such fades five times rarer. And a
+slice can choose its CQI conservatively with `cqi_backoff_db`, as URLLC links do
+in place of TS 38.214's low-BLER CQI table; the example scenarios leave it at 0,
+so the policies, not the margin, decide the outcome.
+
 ## Scenarios
 
 A scenario is a YAML file describing one run completely. Everything but the
@@ -131,6 +212,7 @@ channel:              # the defaults
   shadowing: true
   fading: rayleigh          # or none
   coherence_ms: 40
+  diversity: 1              # fading branches combined at the UE
 
 link:                 # the defaults
   model: adaptive
@@ -157,6 +239,37 @@ ues:
 `link: {model: fixed, bits_per_prb: 500}` replaces the radio channel with a
 fixed number of bits per PRB and no decoding errors, which is useful for
 checking schedulers and traffic in isolation.
+
+A sliced cell lists its slices instead of a top-level scheduler, and each UE
+group names its slice:
+
+```yaml
+slicing:
+  policy: delay_aware       # static, delay_aware or proportional
+  window_ms: 100            # eMBB throughput is checked per window
+
+slices:
+  - name: embb
+    sla: {type: embb, min_throughput_mbps: 2, availability: 0.95}
+    scheduler: {model: pf}  # rr by default
+    quota: 0.80             # needed by the static policy
+  - name: urllc
+    sla: {type: urllc, delay_budget_ms: 5, reliability: 0.999}
+    quota: 0.15
+    cqi_backoff_db: 0       # SINR margin kept when choosing the CQI
+  - name: mmtc
+    sla: {type: mmtc, delay_budget_ms: 1000, reliability: 0.99}
+    quota: 0.05
+
+ues:
+  - name: control
+    slice: urllc
+    count: 10
+    traffic: {model: periodic, period_ms: 5, packet_bytes: 200}
+```
+
+Quotas may add up to less than 1, leaving the rest of the carrier unused under
+the static policy. `slicesim run --policy static` overrides the policy.
 
 The traffic models:
 
@@ -198,7 +311,10 @@ UEs do not move, so these stay fixed for the run.
 **Fading and SINR.** Each UE's channel power gain is exponential with unit mean
 (Rayleigh), held for the coherence time and then redrawn, each UE's blocks
 starting at its own random offset. The default 40 ms is the coherence time of a
-pedestrian at 3.5 GHz (a 9.7 Hz Doppler shift, 0.423 / f_D). The SINR is the
+pedestrian at 3.5 GHz (a 9.7 Hz Doppler shift, 0.423 / f_D). With
+`diversity: N` the gain is that of maximum-ratio combining over N independent
+branches, normalized to unit mean; deep fades below -10 dB happen 9.5% of the
+time with one branch, 1.8% with two and 0.08% with four. The SINR is the
 transmit power per PRB plus antenna gain, minus path loss and shadowing, plus
 fading, over thermal noise in one PRB (-174 dBm/Hz) raised by the noise figure
 and the interference margin. Fading is flat across the carrier.
@@ -222,12 +338,24 @@ delivers them: a packet that decoded waits for an earlier block still being
 retransmitted, so a retransmission delays everything queued behind it, which is
 part of what stretches the video group's 99th percentile above.
 
-**Slot loop.** Each slot, retransmissions go first, then the scheduler shares
-the remaining PRBs among the UEs with data waiting, as their queues stand at the
-start of the slot; packets arriving during the slot wait for the next one.
+**Slices and SLAs.** Each slot, retransmissions are charged to their UE's
+slice, the policy splits the remaining PRBs between slices, and each slice's
+scheduler shares its part among its UEs. A URLLC or mMTC packet violates its
+SLA if it is delivered after the budget, lost to HARQ, or still queued past the
+budget when the run ends; the SLA is met when violations are at most
+1 - reliability. An eMBB UE is owed, in each window, the minimum rate or what
+it asked for (its queue at the start plus what arrived), whichever is less, so
+an idle video UE is never short; the SLA is met when at most 1 - availability
+of UE-windows fall short, and satisfaction is the mean share of the owed rate
+delivered. mMTC also reports connection density: devices meeting the
+reliability target per km^2 of cell.
+
+**Slot loop.** Each slot, retransmissions go first, then the PRBs left are
+shared among the UEs with data waiting, as their queues stand at the start of
+the slot; packets arriving during the slot wait for the next one.
 Arrival times are exact rather than rounded to slots, and a packet's delay runs
 to the end of the slot in which it is released. Per-UE quantities are numpy
-arrays; 100 UEs for 10,000 slots take under six seconds on a laptop.
+arrays; 100 UEs for 10,000 slots take about 6.5 seconds on a laptop.
 
 **Schedulers.** Each slot the scheduler learns how many PRBs are left after
 retransmissions, how many each UE could fill, and how many bits a PRB carries
@@ -266,7 +394,7 @@ periods last five frames on average.
 - [x] Simulation core: carrier tables, seeded slot engine, traffic models, metrics, YAML scenarios
 - [x] Radio channel and link adaptation (TR 38.901 UMa, CQI per TS 38.214, HARQ)
 - [x] MAC schedulers: round robin, max C/I, proportional fair; `slicesim compare`
-- [ ] Network slicing with per-slice SLAs and inter-slice policies
+- [x] Network slicing with per-slice SLAs and inter-slice policies
 - [ ] Gymnasium environment for the slice controller
 - [ ] PPO agent written from scratch; `slicesim train` and `slicesim evaluate`
 - [ ] Experiments, figures, dashboard and v0.1.0

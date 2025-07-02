@@ -1,0 +1,68 @@
+# Low load: about 16 Mbit/s of video on average.
+# Three slices share a 20 MHz urban macro cell: eMBB video in bursts, URLLC
+# control traffic and mMTC sensors. Only the number of video UEs changes
+# between low.yaml, medium.yaml and high.yaml. Run it with:
+#   slicesim run scenarios/low.yaml
+#   slicesim run scenarios/low.yaml --policy static
+name: low
+description: three slices at low load, eight video UEs
+seed: 1
+duration_s: 10
+
+carrier:
+  bandwidth_mhz: 20
+  scs_khz: 30
+
+cell:
+  radius_m: 300
+
+channel:
+  coherence_ms: 40
+  diversity: 2        # two receive antennas, the minimum for an NR FR1 UE
+
+slicing:
+  policy: delay_aware # or static, proportional
+  window_ms: 100
+
+# Static quotas follow each slice's average load, with headroom: video takes
+# most of the cell, control a little, sensors almost nothing.
+slices:
+  - name: embb
+    sla: {type: embb, min_throughput_mbps: 2, availability: 0.95}
+    scheduler: {model: pf, time_constant_ms: 100}
+    quota: 0.80
+  - name: urllc
+    sla: {type: urllc, delay_budget_ms: 5, reliability: 0.999}
+    scheduler: {model: rr}
+    quota: 0.15
+  - name: mmtc
+    sla: {type: mmtc, delay_budget_ms: 1000, reliability: 0.99}
+    scheduler: {model: rr}
+    quota: 0.05
+
+ues:
+  - name: video
+    slice: embb
+    count: 8
+    traffic:            # 3 Mbit/s while on, 2 Mbit/s on average
+      model: on_off
+      mean_on_ms: 2000
+      mean_off_ms: 1000
+      frame_rate_fps: 30
+      frame_bytes: 12500
+
+  - name: control
+    slice: urllc
+    count: 10
+    traffic:            # 200 bytes every 5 ms per UE: 3.2 Mbit/s in all
+      model: periodic
+      period_ms: 5
+      packet_bytes: 200
+
+  - name: sensors
+    slice: mmtc
+    count: 100
+    traffic:
+      model: poisson
+      rate_pps: 1
+      packet_bytes: 100

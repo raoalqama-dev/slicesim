@@ -9,11 +9,13 @@ from slicesim.config import (
     AdaptiveLink,
     CellConfig,
     ChannelConfig,
+    EmbbSla,
     FixedLink,
     OnOffTraffic,
     PoissonTraffic,
     RoundRobinScheduler,
     ScenarioError,
+    UrllcSla,
     load_scenario,
     parse_scenario,
 )
@@ -238,3 +240,102 @@ def test_scenarios_are_immutable() -> None:
     s = scenario()
     with pytest.raises(ValidationError, match="frozen"):
         s.seed = 3  # type: ignore[misc]
+
+
+SLICES = [
+    {"name": "embb", "sla": {"type": "embb", "min_throughput_mbps": 2}, "quota": 0.7},
+    {"name": "urllc", "sla": {"type": "urllc"}, "quota": 0.3},
+]
+
+
+def sliced_data(**changes: Any) -> dict[str, Any]:
+    ues = [
+        {"name": "video", "count": 2, "slice": "embb", "traffic": {"model": "full_buffer"}},
+        {
+            "name": "ctrl",
+            "count": 2,
+            "slice": "urllc",
+            "traffic": {"model": "periodic", "period_ms": 5, "packet_bytes": 50},
+        },
+    ]
+    return scenario_data(**{"slices": SLICES, "ues": ues, **changes})
+
+
+def test_a_sliced_scenario() -> None:
+    s = parse_scenario(sliced_data())
+    assert [x.name for x in s.slices] == ["embb", "urllc"]
+    assert s.slicing is None
+    assert s.slicing_config.policy == "delay_aware"
+    assert s.slicing_config.window_ms == 100
+    urllc = s.slices[1].sla
+    assert isinstance(urllc, UrllcSla)
+    assert (urllc.delay_budget_ms, urllc.reliability) == (5.0, 0.999)
+    embb = s.slices[0].sla
+    assert isinstance(embb, EmbbSla)
+    assert embb.availability == 0.95
+    assert s.slices[0].scheduler == RoundRobinScheduler()
+    assert s.slices[0].cqi_backoff_db == 0.0
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected"),
+    [
+        ({"slicing": {"policy": "static"}, "slices": []}, "slicing needs slices"),
+        (
+            {"slices": [], "ues": [{**poisson_group(), "slice": "embb"}]},
+            "UE groups name slices but none are defined: web",
+        ),
+        (
+            {"ues": [poisson_group()]},
+            "UE group web must name its slice",
+        ),
+        (
+            {"ues": [{**poisson_group(), "slice": "gold"}]},
+            "UE group web names slice 'gold', which is not defined; slices are embb, urllc",
+        ),
+        (
+            {"ues": [{**poisson_group(), "slice": "embb"}]},
+            "slices without UEs: urllc",
+        ),
+        (
+            {"slices": [SLICES[0], {**SLICES[1], "name": "embb"}]},
+            "slice names must be unique; repeated: embb",
+        ),
+        (
+            {"scheduler": {"model": "pf"}},
+            "a sliced cell sets a scheduler in each slice, not at the top level",
+        ),
+        (
+            {"slicing": {"policy": "static"}, "slices": [SLICES[0], {**SLICES[1], "quota": None}]},
+            "the static policy needs a quota for every slice; missing: urllc",
+        ),
+        (
+            {"slicing": {"policy": "static"}, "slices": [SLICES[0], {**SLICES[1], "quota": 0.5}]},
+            "slice quotas add up to 1.2, more than 1",
+        ),
+        (
+            {"slicing": {"policy": "fair"}},
+            "slicing.policy: Input should be 'static', 'delay_aware' or 'proportional' "
+            "(got 'fair')",
+        ),
+        (
+            {"slices": [SLICES[0], {**SLICES[1], "sla": {"type": "gold"}}]},
+            "slices[1].sla: unknown 'type' 'gold'; expected one of 'embb', 'urllc', 'mmtc'",
+        ),
+        (
+            {"slices": [SLICES[0], {**SLICES[1], "sla": {"type": "urllc", "reliability": 1}}]},
+            "slices[1].sla.reliability: Input should be less than 1 (got 1)",
+        ),
+        (
+            {"slices": [{**SLICES[0], "sla": {"type": "embb"}}, SLICES[1]]},
+            "slices[0].sla.min_throughput_mbps: Field required",
+        ),
+    ],
+)
+def test_invalid_slicing_fails_with_clear_messages(changes: dict[str, Any], expected: str) -> None:
+    assert problems(sliced_data(**changes)) == [expected]
+
+
+def test_replace_keeps_a_sliced_scenario_valid() -> None:
+    s = parse_scenario(sliced_data())
+    assert s.replace(seed=3).slices == s.slices

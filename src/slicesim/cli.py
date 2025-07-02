@@ -9,10 +9,11 @@ from collections.abc import Sequence
 from typing import TextIO
 
 from slicesim import __version__
-from slicesim.compare import SCHEDULERS, compare_schedulers
+from slicesim.compare import SCHEDULERS, compare_schedulers, with_policy
 from slicesim.config import Scenario, ScenarioError, load_scenario
 from slicesim.engine import simulate
 from slicesim.report import render_comparison, render_summary
+from slicesim.slicing import POLICIES
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -76,6 +77,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Simulate a scenario and print a summary per UE group.",
     )
     _add_scenario_arguments(run)
+    run.add_argument(
+        "--policy",
+        choices=POLICIES,
+        help="override a sliced scenario's inter-slice policy",
+    )
 
     compare = commands.add_parser(
         "compare",
@@ -113,6 +119,11 @@ def _load(args: argparse.Namespace) -> Scenario:
 
 def _run(args: argparse.Namespace, out: TextIO) -> int:
     scenario = _load(args)
+    if args.policy is not None:
+        try:
+            scenario = with_policy(scenario, args.policy)
+        except ScenarioError as exc:
+            raise ScenarioError(args.scenario, exc.problems) from None
     summary = simulate(scenario).summary()
     if args.json:
         json.dump(summary.to_dict(), out, indent=2)

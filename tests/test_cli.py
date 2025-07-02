@@ -291,3 +291,54 @@ def test_compare_reports_an_invalid_scenario(tmp_path: Path) -> None:
 def test_render_comparison_needs_runs() -> None:
     with pytest.raises(ValueError, match="nothing to compare"):
         render_comparison([])
+
+
+MEDIUM = Path(__file__).resolve().parent.parent / "scenarios" / "medium.yaml"
+
+
+@pytest.fixture
+def sliced_file(tmp_path: Path) -> Path:
+    data = yaml.safe_load(MEDIUM.read_text(encoding="utf-8"))
+    data["duration_s"] = 0.3
+    path = tmp_path / "sliced.yaml"
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    return path
+
+
+def test_run_prints_a_slice_table(sliced_file: Path) -> None:
+    code, out, err = run("run", str(sliced_file))
+    assert (code, err) == (0, "")
+    lines = out.splitlines()
+    assert "  slicing   delay-aware policy" in lines
+    assert (
+        "  scheduler embb proportional fair (100 ms average); urllc round robin; mmtc round robin"
+    ) in lines
+    header = next(line for line in lines if line.startswith("slice "))
+    assert header.split()[:4] == ["slice", "UEs", "PRBs", "delivered"]
+    start = lines.index(header) + 2
+    rows = [line.split() for line in lines[start : start + 3]]
+    assert [row[0] for row in rows] == ["embb", "urllc", "mmtc"]
+    assert any(line.endswith("urllc: 0.999 of packets within 5 ms") for line in lines)
+
+
+def test_run_can_override_the_policy(sliced_file: Path) -> None:
+    code, out, _ = run("run", str(sliced_file), "--policy", "static")
+    assert code == 0
+    assert "  slicing   static quotas policy (embb 80%, urllc 15%, mmtc 5%)" in out
+    _, out, _ = run("run", str(sliced_file), "--policy", "proportional", "--json")
+    data = json.loads(out)
+    assert [s["name"] for s in data["slices"]] == ["embb", "urllc", "mmtc"]
+    assert {"violation_ratio", "met", "satisfaction", "prb_share"} <= set(data["slices"][0])
+
+
+def test_a_policy_needs_slices(small: Path) -> None:
+    code, _, err = run("run", str(small), "--policy", "static")
+    assert code == 2
+    assert err == f"slicesim: {small}: invalid scenario\n  slicing needs slices\n"
+
+
+def test_compare_on_a_sliced_cell_sets_every_slices_scheduler(sliced_file: Path) -> None:
+    code, out, _ = run("compare", str(sliced_file), "--schedulers", "maxci,pf")
+    assert code == 0
+    assert "max C/I" in out
+    assert "embb proportional fair (100 ms average); urllc proportional fair" in out

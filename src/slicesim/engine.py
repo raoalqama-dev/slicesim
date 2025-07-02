@@ -19,6 +19,7 @@ out.
 
 from __future__ import annotations
 
+import math
 import zlib
 from collections import deque
 from itertools import pairwise
@@ -31,7 +32,8 @@ from slicesim.channel.link import bits_per_prb, bler, cqi_from_sinr
 from slicesim.config import AdaptiveLink, Scenario
 from slicesim.harq import BlockState, DeliveryQueue, Harq, TransportBlock
 from slicesim.metrics import MetricsCollector, SimulationResult
-from slicesim.schedulers import SlotDemand, build_scheduler
+from slicesim.schedulers import SlotDemand
+from slicesim.slicing import SliceDemand, SlicingPolicy, build_policy, build_slices, ue_slices
 from slicesim.traffic import Arrivals, TrafficSource, build_source
 from slicesim.ue import UEPopulation
 
@@ -76,10 +78,18 @@ class Simulation:
         )
         counts = np.array([group.count for group in scenario.ues])
         self._group_start = (np.cumsum(counts) - counts).tolist()
-        self.metrics = MetricsCollector(self.ues.size, self.n_slots)
-        self.scheduler = build_scheduler(
-            scenario.scheduler, self.ues.size, self.carrier.slot_duration_s
+        self.slices = build_slices(scenario, self.ues.group, self.carrier.slot_duration_s)
+        self.ue_slice = ue_slices(self.slices, self.ues.size)
+        self.policy: SlicingPolicy = build_policy(scenario, self.slices, self.carrier.n_prb)
+        """The inter-slice policy; a controller may replace it between slots."""
+        window_s = scenario.slicing_config.window_ms * 1e-3
+        self.window_slots = max(1, round(window_s / self.carrier.slot_duration_s))
+        self.metrics = MetricsCollector(
+            self.ues.size, self.n_slots, n_slices=len(self.slices), window_slots=self.window_slots
         )
+        self._cqi_backoff_db = np.zeros(self.ues.size)
+        for s in self.slices:
+            self._cqi_backoff_db[s.members] = s.cqi_backoff_db
         self.delivery = [None if b is None else DeliveryQueue() for b in self.ues.buffers]
 
         link = scenario.link
@@ -140,6 +150,19 @@ class Simulation:
                 waiting[block.ue] += block.nbytes
         return waiting
 
+    def overdue_packets(self) -> npt.NDArray[np.int64]:
+        """Per UE, packets queued now that have waited longer than the slice's delay budget."""
+        overdue = np.zeros(self.ues.size, dtype=np.int64)
+        for s in self.slices:
+            if math.isinf(s.delay_budget_s):
+                continue
+            cutoff = self.now - s.delay_budget_s
+            for ue in s.members.tolist():
+                buffer = self.ues.buffers[ue]
+                if buffer is not None:
+                    overdue[ue] = buffer.waiting_since(cutoff)
+        return overdue
+
     def result(self) -> SimulationResult:
         """What the run has recorded so far."""
         m = self.metrics
@@ -171,6 +194,13 @@ class Simulation:
             mean_sinr_db=None if channel is None else channel.mean_sinr_db.copy(),
             mean_cqi=None if channel is None else m.cqi_sum / max(self.slot, 1),
             mean_buffer_bytes=m.backlog_sum / max(self.slot, 1),
+            ue_slice=self.ue_slice,
+            slice_prbs=m.slice_prbs[: self.slot].copy(),
+            window_slots=self.window_slots,
+            window_delivered=m.window_delivered.copy(),
+            window_offered=m.window_offered.copy(),
+            window_backlog=m.window_backlog.copy(),
+            overdue_packets=self.overdue_packets(),
         )
 
     def _link_state(
@@ -182,9 +212,10 @@ class Simulation:
         link = self.scenario.link
         assert isinstance(link, AdaptiveLink)
         sinr = self.channel.sinr_db(self.slot)
-        # The scheduler only knows the CQI the UE reported cqi_delay_slots ago.
+        # The scheduler only knows the CQI the UE reported cqi_delay_slots ago, and
+        # chooses it with the slice's back-off margin.
         self._sinr_history.append(sinr)
-        cqi = cqi_from_sinr(self._sinr_history[0])
+        cqi = cqi_from_sinr(self._sinr_history[0] - self._cqi_backoff_db)
         self.metrics.cqi_sum += cqi
         return bits_per_prb(cqi, link.overhead), sinr, cqi
 
@@ -194,8 +225,10 @@ class Simulation:
         sinr: npt.NDArray[np.float64],
         delivered: npt.NDArray[np.int64],
         resolved: set[int],
-    ) -> int:
-        """Send the retransmissions due this slot; returns the PRBs they used.
+        retx_prbs: npt.NDArray[np.int64],
+    ) -> None:
+        """Send the retransmissions due this slot, adding their PRBs to ``retx_prbs``
+        under each UE's slice.
 
         They always fit: the blocks due now are exactly those that failed one
         round trip ago, and those were all sent within that slot's PRBs.
@@ -205,6 +238,8 @@ class Simulation:
         used = sum(block.prbs for block in sending)
         if used > self.carrier.n_prb:
             raise RuntimeError(f"retransmissions need {used} PRBs, more than the carrier has")
+        for block in sending:
+            retx_prbs[self.ue_slice[block.ue]] += block.prbs
         draws = self._decoding.random(len(sending)).tolist()
         for block, draw in zip(sending, draws, strict=True):
             harq.transmit(block, self.slot, float(sinr[block.ue]), draw)
@@ -217,7 +252,50 @@ class Simulation:
                 m.blocks_dropped[block.ue] += 1
                 m.dropped_bytes[block.ue] += block.nbytes
             resolved.add(block.ue)
-        return used
+
+    def _allocate(
+        self,
+        free: int,
+        retx_prbs: npt.NDArray[np.int64],
+        bits: npt.NDArray[np.int64],
+    ) -> npt.NDArray[np.int64]:
+        """New-data PRBs per UE: the policy splits ``free`` between slices, then each
+        slice's scheduler shares its part among its UEs."""
+        # A UE out of coverage (CQI 0) can carry nothing.
+        reachable = bits > 0
+        need = np.zeros(self.ues.size, dtype=np.int64)
+        need[reachable] = -(-self.ues.backlog_bytes[reachable] * 8 // bits[reachable])
+        need[self.ues.full_buffer & reachable] = free
+        need = np.minimum(need, free)
+        slice_need = np.array(
+            [min(int(need[s.members].sum()), free) for s in self.slices], dtype=np.int64
+        )
+        budgets = self.policy.split(
+            SliceDemand(
+                slot=self.slot,
+                n_prb=self.carrier.n_prb,
+                free=free,
+                retx_prbs=retx_prbs,
+                need=slice_need,
+            )
+        )
+        if np.any(budgets < 0) or int(budgets.sum()) > free:
+            raise RuntimeError(
+                f"policy {self.policy.name} split {budgets.tolist()} of {free} free PRBs"
+            )
+        prbs = np.zeros(self.ues.size, dtype=np.int64)
+        for s, budget in zip(self.slices, budgets.tolist(), strict=True):
+            if budget > 0:
+                members = s.members
+                prbs[members] = s.scheduler.allocate(
+                    SlotDemand(
+                        slot=self.slot,
+                        n_prb=budget,
+                        need=np.minimum(need[members], budget),
+                        bits_per_prb=bits[members],
+                    )
+                )
+        return prbs
 
     def _run_slot(self) -> None:
         slot = self.slot
@@ -232,20 +310,15 @@ class Simulation:
         delays: list[float] = []
         resolved: set[int] = set()
 
-        retx_prbs = 0
+        retx_prbs = np.zeros(len(self.slices), dtype=np.int64)
         if self.harq is not None and sinr is not None and len(self.harq):
-            retx_prbs = self._retransmit(self.harq, sinr, delivered, resolved)
-        free = self.carrier.n_prb - retx_prbs
+            self._retransmit(self.harq, sinr, delivered, resolved, retx_prbs)
+        free = self.carrier.n_prb - int(retx_prbs.sum())
 
         m.backlog_sum += self.ues.backlog_bytes
-        # New data shares what is left; a UE out of coverage (CQI 0) gets nothing.
-        reachable = bits > 0
-        need = np.zeros(self.ues.size, dtype=np.int64)
-        need[reachable] = -(-self.ues.backlog_bytes[reachable] * 8 // bits[reachable])
-        need[self.ues.full_buffer & reachable] = free
-        prbs = self.scheduler.allocate(
-            SlotDemand(slot=slot, n_prb=free, need=np.minimum(need, free), bits_per_prb=bits)
-        )
+        if slot % self.window_slots == 0:
+            m.start_window(slot, self.ues.backlog_bytes)
+        prbs = self._allocate(free, retx_prbs, bits)
         scheduled = np.flatnonzero(prbs)
         if sinr is None or cqi is None:
             decoded = np.ones(scheduled.size, dtype=np.bool_)
@@ -305,8 +378,10 @@ class Simulation:
                 m.packets_lost[i] += queue.release(t1, delays)
                 delay_ue.extend([i] * (len(delays) - before))
 
-        self.scheduler.delivered(delivered * 8)
-        m.record_slot(slot, retx_prbs + int(prbs.sum()), delivered)
+        for s in self.slices:
+            s.scheduler.delivered(delivered[s.members] * 8)
+            m.slice_prbs[slot, s.index] = retx_prbs[s.index] + prbs[s.members].sum()
+        m.record_slot(slot, int(retx_prbs.sum() + prbs.sum()), delivered)
         m.record_delays(np.asarray(delay_ue, dtype=np.intp), np.asarray(delays, dtype=np.float64))
 
         # Packets arriving during the slot wait for a later one.
@@ -318,7 +393,7 @@ class Simulation:
 
     def _enqueue(self, arrivals: Arrivals, start: int) -> None:
         ue = arrivals.ue + start
-        self.metrics.record_arrivals(ue, arrivals.size)
+        self.metrics.record_arrivals(ue, arrivals.size, self.slot)
         firsts = np.flatnonzero(np.diff(ue, prepend=-1))
         bounds = [*firsts.tolist(), len(ue)]
         times = arrivals.time.tolist()
