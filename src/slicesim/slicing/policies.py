@@ -126,3 +126,48 @@ class Proportional(SlicingPolicy):
         if total <= demand.free:
             return need.copy()
         return largest_remainder(demand.free * need / total, demand.free)
+
+
+class WeightedShares(SlicingPolicy):
+    """Split the PRBs by weight, passing on what a slice cannot use.
+
+    Each slice with something to send gets free * w_s / sum(w) of the PRBs,
+    rounded by largest remainder; a slice that needs less than its share
+    keeps only its need, and the rest is split again by weight among the
+    slices still wanting. A controller sets ``weights`` between slots: with
+    weights from a softmax over one logit per slice, every action is a valid
+    split.
+    """
+
+    name = "weighted"
+
+    def __init__(self, weights: npt.ArrayLike) -> None:
+        self.weights = np.asarray(weights, dtype=np.float64)
+
+    @property
+    def weights(self) -> npt.NDArray[np.float64]:
+        return self._weights
+
+    @weights.setter
+    def weights(self, value: npt.NDArray[np.float64]) -> None:
+        if value.ndim != 1 or np.any(value < 0) or not np.all(np.isfinite(value)):
+            raise ValueError("weights must be finite and non-negative, one per slice")
+        self._weights = value
+
+    def split(self, demand: SliceDemand) -> IntArray:
+        need = demand.need
+        if need.shape != self._weights.shape:
+            raise ValueError(f"expected {need.size} weights, got {self._weights.size}")
+        alloc = np.zeros_like(need)
+        left = demand.free
+        wanting = need > 0
+        while left > 0 and wanting.any():
+            weights = np.where(wanting, self._weights, 0.0)
+            if weights.sum() <= 0:
+                # Only zero-weight slices want PRBs: share equally among them.
+                weights = wanting.astype(np.float64)
+            give = np.minimum(largest_remainder(left * weights / weights.sum(), left), need - alloc)
+            alloc += give
+            left -= int(give.sum())
+            wanting = alloc < need
+        return alloc

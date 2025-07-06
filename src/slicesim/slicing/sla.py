@@ -70,6 +70,35 @@ def packet_violations(
     return late + lost + overdue, int(delay_s.size) + lost + overdue
 
 
+@dataclass(frozen=True)
+class WindowCounts:
+    """eMBB UE-windows: how many owed something, how many fell short, and the
+    sum of the shares of what was owed that each received."""
+
+    counted: int
+    short: int
+    satisfaction_sum: float
+
+
+def embb_window_counts(
+    delivered: npt.NDArray[np.int64],
+    offered: npt.NDArray[np.int64],
+    backlog: npt.NDArray[np.int64],
+    full_buffer: npt.NDArray[np.bool_],
+    min_bits: float,
+) -> WindowCounts:
+    """Count UE-windows against an eMBB SLA; arrays are shaped (windows, UEs)."""
+    owed = np.minimum((offered + backlog) * 8.0, min_bits)
+    owed[:, full_buffer] = min_bits
+    counted = owed > 0
+    got = delivered * 8.0
+    short = (got < owed - 1e-9) & counted
+    share = np.where(counted, np.minimum(got / np.where(counted, owed, 1.0), 1.0), 0.0)
+    return WindowCounts(
+        counted=int(counted.sum()), short=int(short.sum()), satisfaction_sum=float(share.sum())
+    )
+
+
 def embb_windows(
     delivered: npt.NDArray[np.int64],
     offered: npt.NDArray[np.int64],
@@ -78,15 +107,10 @@ def embb_windows(
     min_bits: float,
 ) -> tuple[float | None, float | None]:
     """Violation ratio and satisfaction over UE-windows, arrays shaped (windows, UEs)."""
-    owed = np.minimum((offered + backlog) * 8.0, min_bits)
-    owed[:, full_buffer] = min_bits
-    counted = owed > 0
-    if not counted.any():
+    counts = embb_window_counts(delivered, offered, backlog, full_buffer, min_bits)
+    if not counts.counted:
         return None, None
-    got = delivered * 8.0
-    short = (got < owed - 1e-9) & counted
-    ratio = np.where(counted, np.minimum(got / np.where(counted, owed, 1.0), 1.0), 0.0)
-    return float(short.sum() / counted.sum()), float(ratio.sum() / counted.sum())
+    return counts.short / counts.counted, counts.satisfaction_sum / counts.counted
 
 
 def summarize_slices(result: SimulationResult) -> list[SliceSummary]:

@@ -92,3 +92,15 @@ class TestUEPopulation:
         ues = UEPopulation.from_groups([1, 1], [False, True])
         assert ues.group.dtype == np.intp
         assert ues.backlog_bytes.dtype == np.int64
+
+
+def test_head_of_line_delay() -> None:
+    ues = UEPopulation.from_groups([2, 1], [False, True])
+    ues.enqueue(1, [0.25, 0.5], [10, 10])
+    assert ues.head_of_line_delay(1.0).tolist() == [0.0, 0.75, 0.0]
+    buffer = ues.buffers[1]
+    assert buffer is not None
+    assert buffer.waiting_since(0.4) == 1
+    assert buffer.waiting_since(1.0) == 2
+    ues.serve(1, 10, [])
+    assert ues.head_of_line_delay(1.0).tolist() == [0.0, 0.5, 0.0]

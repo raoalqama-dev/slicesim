@@ -230,3 +230,14 @@ def test_static_quotas_violate_urllc_while_delay_aware_does_not() -> None:
     assert static.violation_ratio > 0.002
     assert delay_aware.met is True
     assert delay_aware.violation_ratio <= 0.001
+
+
+def test_late_packets_are_counted_against_each_ues_budget() -> None:
+    s = sliced("proportional")
+    sim = Simulation(s)
+    r = sim.run()
+    budget = sim.delay_budget_s
+    assert budget[r.ue_slice == 0].tolist() == [float("inf")] * 3
+    assert np.all(budget[r.ue_slice == 1] == 0.005)
+    late = np.bincount(r.delay_ue[r.delay_s > budget[r.delay_ue]], minlength=r.ue_slice.size)
+    assert np.array_equal(r.packets_late, late)

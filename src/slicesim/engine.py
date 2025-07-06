@@ -88,8 +88,14 @@ class Simulation:
             self.ues.size, self.n_slots, n_slices=len(self.slices), window_slots=self.window_slots
         )
         self._cqi_backoff_db = np.zeros(self.ues.size)
+        self.delay_budget_s = np.full(self.ues.size, math.inf)
+        """Each UE's packet delay budget, from its slice; infinite for eMBB."""
         for s in self.slices:
             self._cqi_backoff_db[s.members] = s.cqi_backoff_db
+            self.delay_budget_s[s.members] = s.delay_budget_s
+        self.reported_cqi: npt.NDArray[np.intp] | None = None
+        """The CQI the scheduler used in the last slot (before the first, the CQI of
+        each UE's mean SINR); None on the fixed link."""
         self.delivery = [None if b is None else DeliveryQueue() for b in self.ues.buffers]
 
         link = scenario.link
@@ -115,6 +121,7 @@ class Simulation:
                 ],
             )
             self.harq = Harq(link.harq_rtt_slots, link.max_transmissions)
+            self.reported_cqi = cqi_from_sinr(self.channel.mean_sinr_db - self._cqi_backoff_db)
         else:
             self._fixed_bits[:] = link.bits_per_prb
         cqi_delay = link.cqi_delay_slots if isinstance(link, AdaptiveLink) else 0
@@ -179,6 +186,7 @@ class Simulation:
             packets_arrived=m.packets_arrived.copy(),
             packets_delivered=m.packets_delivered.copy(),
             packets_lost=m.packets_lost.copy(),
+            packets_late=m.packets_late.copy(),
             backlog_bytes=self.ues.backlog_bytes.copy(),
             in_flight_bytes=self.in_flight_bytes(),
             dropped_bytes=m.dropped_bytes.copy(),
@@ -217,6 +225,7 @@ class Simulation:
         self._sinr_history.append(sinr)
         cqi = cqi_from_sinr(self._sinr_history[0] - self._cqi_backoff_db)
         self.metrics.cqi_sum += cqi
+        self.reported_cqi = cqi
         return bits_per_prb(cqi, link.overhead), sinr, cqi
 
     def _retransmit(
@@ -382,7 +391,12 @@ class Simulation:
             s.scheduler.delivered(delivered[s.members] * 8)
             m.slice_prbs[slot, s.index] = retx_prbs[s.index] + prbs[s.members].sum()
         m.record_slot(slot, int(retx_prbs.sum() + prbs.sum()), delivered)
-        m.record_delays(np.asarray(delay_ue, dtype=np.intp), np.asarray(delays, dtype=np.float64))
+        delay_ues = np.asarray(delay_ue, dtype=np.intp)
+        delay_values = np.asarray(delays, dtype=np.float64)
+        m.record_delays(delay_ues, delay_values)
+        late = delay_ues[delay_values > self.delay_budget_s[delay_ues]]
+        if late.size:
+            m.packets_late += np.bincount(late, minlength=self.ues.size)
 
         # Packets arriving during the slot wait for a later one.
         for source, start in zip(self.sources, self._group_start, strict=True):

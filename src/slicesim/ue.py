@@ -43,6 +43,10 @@ class PacketBuffer:
             self._sizes.append(size)
             self.backlog_bytes += size
 
+    def head_of_line_delay(self, now: float) -> float:
+        """How long the oldest queued packet has waited; 0 when the queue is empty."""
+        return now - self._arrivals[0] if self._arrivals else 0.0
+
     def waiting_since(self, time: float) -> int:
         """How many queued packets arrived before ``time``."""
         count = 0
@@ -109,6 +113,14 @@ class UEPopulation:
     @property
     def size(self) -> int:
         return int(self.group.size)
+
+    def head_of_line_delay(self, now: float) -> npt.NDArray[np.float64]:
+        """Each UE's head-of-line delay; 0 for full-buffer UEs and empty queues."""
+        return np.fromiter(
+            (0.0 if b is None else b.head_of_line_delay(now) for b in self.buffers),
+            dtype=np.float64,
+            count=self.size,
+        )
 
     def enqueue(self, ue: int, arrival_times: list[float], sizes: list[int]) -> None:
         """Queue packets for one UE, in arrival order."""

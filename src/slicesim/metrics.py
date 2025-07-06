@@ -35,6 +35,8 @@ class MetricsCollector:
         """Bytes in transport blocks that decoded."""
         self.packets_delivered = np.zeros(n_ues, dtype=np.int64)
         self.packets_lost = np.zeros(n_ues, dtype=np.int64)
+        self.packets_late = np.zeros(n_ues, dtype=np.int64)
+        """Packets delivered after their slice's delay budget."""
         self.blocks_sent = np.zeros(n_ues, dtype=np.int64)
         """First transmissions of transport blocks."""
         self.blocks_failed = np.zeros(n_ues, dtype=np.int64)
@@ -204,6 +206,8 @@ class SimulationResult:
     packets_arrived: IntArray
     packets_delivered: IntArray
     packets_lost: IntArray
+    packets_late: IntArray
+    """Packets delivered after their slice's delay budget."""
     backlog_bytes: IntArray
     in_flight_bytes: IntArray
     """Bytes in blocks waiting for a retransmission when the run ended."""

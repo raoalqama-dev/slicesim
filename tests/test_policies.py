@@ -1,7 +1,14 @@
 import numpy as np
 import pytest
 
-from slicesim.slicing import DelayAware, Proportional, SliceDemand, StaticQuotas, WholeCell
+from slicesim.slicing import (
+    DelayAware,
+    Proportional,
+    SliceDemand,
+    StaticQuotas,
+    WeightedShares,
+    WholeCell,
+)
 from slicesim.slicing.policies import largest_remainder
 
 
@@ -63,3 +70,49 @@ class TestPolicies:
                 assert np.all(split >= 0)
                 assert np.all(split <= need)
                 assert split.sum() == min(free, need.sum())
+
+
+class TestWeightedShares:
+    def test_splits_by_weight(self) -> None:
+        policy = WeightedShares([0.6, 0.3, 0.1])
+        assert policy.split(demand([100, 100, 100])).tolist() == [31, 15, 5]
+
+    def test_passes_on_what_a_slice_cannot_use(self) -> None:
+        policy = WeightedShares([0.6, 0.3, 0.1])
+        # eMBB needs only 5: the other 46 are split 3:1 between the rest.
+        assert policy.split(demand([5, 100, 100])).tolist() == [5, 35, 11]
+        assert policy.split(demand([0, 0, 3])).tolist() == [0, 0, 3]
+        assert policy.split(demand([1, 1, 1])).tolist() == [1, 1, 1]
+
+    def test_zero_weights_still_get_spare_prbs(self) -> None:
+        policy = WeightedShares([1.0, 0.0, 0.0])
+        split = policy.split(demand([0, 20, 10]))
+        assert split.sum() == 30
+        assert split.tolist() == [0, 20, 10]
+
+    def test_weights_can_change_between_slots(self) -> None:
+        policy = WeightedShares([1.0, 1.0])
+        assert policy.split(demand([60, 60])).sum() == 51
+        policy.weights = np.array([3.0, 1.0])
+        assert policy.weights.tolist() == [3.0, 1.0]
+        assert policy.split(demand([60, 60])).tolist() == [38, 13]
+
+    def test_rejects_bad_weights(self) -> None:
+        with pytest.raises(ValueError, match="non-negative"):
+            WeightedShares([1.0, -0.5])
+        with pytest.raises(ValueError, match="finite"):
+            WeightedShares([np.inf, 1.0])
+        with pytest.raises(ValueError, match="expected 3 weights, got 2"):
+            WeightedShares([1.0, 1.0]).split(demand([1, 1, 1]))
+
+    @pytest.mark.parametrize("seed", range(10))
+    def test_never_overspends_and_wastes_nothing(self, seed: int) -> None:
+        gen = np.random.default_rng(seed)
+        for _ in range(50):
+            policy = WeightedShares(gen.dirichlet(np.ones(3)))
+            need = gen.integers(0, 60, 3)
+            free = int(gen.integers(0, 52))
+            split = policy.split(demand(need.tolist(), free=free))
+            assert np.all(split >= 0)
+            assert np.all(split <= need)
+            assert split.sum() == min(free, need.sum())

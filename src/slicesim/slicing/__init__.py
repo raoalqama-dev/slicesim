@@ -9,6 +9,7 @@ from slicesim.slicing.policies import (
     SliceDemand,
     SlicingPolicy,
     StaticQuotas,
+    WeightedShares,
     WholeCell,
 )
 from slicesim.slicing.slices import Slice, build_slices, ue_slices
@@ -23,6 +24,7 @@ __all__ = [
     "SliceDemand",
     "SlicingPolicy",
     "StaticQuotas",
+    "WeightedShares",
     "WholeCell",
     "build_policy",
     "build_slices",

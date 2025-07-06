@@ -17,8 +17,8 @@ HARQ. Round robin, max C/I and proportional fair schedulers share the PRBs, and
 `slicesim compare` runs a scenario under each of them. The cell can be split
 into eMBB, URLLC and mMTC slices, each with its own SLA and scheduler, under a
 static, delay-aware or demand-proportional policy, with SLA accounting per
-slice. The Gymnasium environment for a learned slice controller is next on the
-[roadmap](#roadmap).
+slice. A Gymnasium environment lets an agent take the policy's place; the PPO
+agent that learns in it is next on the [roadmap](#roadmap).
 
 ## Quick start
 
@@ -182,6 +182,70 @@ minimum for an NR FR1 device), which makes such fades five times rarer. And a
 slice can choose its CQI conservatively with `cqi_backoff_db`, as URLLC links do
 in place of TS 38.214's low-BLER CQI table; the example scenarios leave it at 0,
 so the policies, not the margin, decide the outcome.
+
+## Reinforcement learning environment
+
+`pip install -e ".[rl]"` adds a [Gymnasium](https://gymnasium.farama.org)
+environment in which an agent replaces the inter-slice policy and decides, every
+decision interval, how the cell is shared between slices:
+
+```python
+import gymnasium as gym
+from slicesim.config import load_scenario
+from slicesim.rl.env import ENV_ID
+
+levels = [load_scenario(f"scenarios/{load}.yaml") for load in ("low", "medium", "high")]
+env = gym.make(ENV_ID, levels=levels, decision_slots=10, episode_s=1.0)
+obs, info = env.reset(seed=0)  # info["level"] is the load level drawn
+obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+```
+
+- **Steps.** Each step runs `decision_slots` slots (10 by default, 5 ms at
+  30 kHz) under one split. An episode is `episode_s` long and ends truncated.
+- **Action.** One value in [-1, 1] per slice, a logit scaled by 5. A softmax
+  turns the logits into weights, and the PRBs left after retransmissions are
+  shared by those weights, a slice that cannot use its share passing the rest
+  on. Every action is a valid split, and each slice's own scheduler still
+  shares its part among its UEs.
+- **Observation.** Five features per slice, 15 for the three slices:
+
+  | Feature | Value |
+  | ------- | ----- |
+  | queue backlog | queued bytes B as B / (B + C), C the carrier's peak bytes per step |
+  | head-of-line delay | oldest packet's wait d as d / (d + D), D the delay budget (the SLA window for eMBB) |
+  | recent throughput | bytes delivered in the last step over C |
+  | mean CQI | reported CQI over 15 |
+  | SLA slack, -1 to 1 | URLLC and mMTC: 1 - 2 min(d / D, 1); eMBB: 2s - 1, s the share of the owed rate received so far this window |
+
+- **Reward.** For each slice, a weight times its satisfaction in the step, minus
+  a penalty per new violation (`RewardConfig`; by default weights 1, 1 and 0.5
+  and penalties 0.2, 1 and 0.1 for eMBB, URLLC and mMTC). URLLC and mMTC
+  satisfaction is the share of packets delivered on time, and a violation is
+  counted when a packet passes its deadline, whether it is then delivered late,
+  still queued or lost: starving a slice costs reward as it happens, and over an
+  episode the penalties count exactly the violations the SLA report shows. eMBB
+  satisfaction is the share of the owed rate each UE got in the step, and its
+  violations are the UE-windows short of the minimum, counted as each window
+  closes.
+- **Episodes.** Each reset draws a load level and a scenario seed from the
+  environment's seeded generator (`options={"level": i}` picks a level), so
+  `reset(seed=s)` followed by the same actions replays the same episode. The
+  environment passes `gymnasium.utils.env_checker.check_env`.
+
+Fixed actions over six one-second episodes (seeds 0 to 5), a baseline for the
+agent:
+
+| Action | Mean return | URLLC violations | eMBB short windows |
+| ------ | ----------: | ---------------: | -----------------: |
+| equal weights | 461.8 | 30 | 20 |
+| URLLC weighted up | 461.9 | 30 | 22 |
+| eMBB weighted up | -722.6 | 7,012 | 10 |
+| random | 298.1 | 965 | 19 |
+
+Because a slice passes on what it cannot use, equal weights already serve the
+small URLLC slice almost at once, and its remaining violations come from HARQ
+retransmissions, not from the split. Weighting eMBB up instead starves URLLC,
+and the reward shows it.
 
 ## Scenarios
 
@@ -395,18 +459,20 @@ periods last five frames on average.
 - [x] Radio channel and link adaptation (TR 38.901 UMa, CQI per TS 38.214, HARQ)
 - [x] MAC schedulers: round robin, max C/I, proportional fair; `slicesim compare`
 - [x] Network slicing with per-slice SLAs and inter-slice policies
-- [ ] Gymnasium environment for the slice controller
+- [x] Gymnasium environment for the slice controller
 - [ ] PPO agent written from scratch; `slicesim train` and `slicesim evaluate`
 - [ ] Experiments, figures, dashboard and v0.1.0
 
 ## Development
 
 ```sh
-pip install -e ".[dev]"
+pip install -e ".[dev,rl]"
 ruff check . && ruff format --check .   # lint and formatting
 mypy                                    # strict type checking of src and tests
 pytest --cov                            # tests, with a 90% coverage floor
 ```
 
-CI runs the same checks, the tests on Python 3.11 to 3.14, and the tests again
-against the oldest dependency versions `pyproject.toml` allows.
+Without the `rl` extra the environment's tests are skipped. CI runs the same
+checks, the tests on Python 3.11 to 3.14 without the extra, all of them with
+coverage in a job that installs it, and the tests again against the oldest
+dependency versions `pyproject.toml` allows.

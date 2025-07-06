@@ -30,6 +30,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+rl = [
+    "gymnasium>=1.0",
+]
 dev = [
     "mypy>=1.11",
     "pytest>=8.0",
