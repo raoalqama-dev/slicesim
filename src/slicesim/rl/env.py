@@ -35,9 +35,12 @@ minus a penalty times its new violations.
   Violations are the UE-windows short of the minimum, counted when each SLA
   window closes.
 
-Each reset picks one of the load levels at random and a fresh scenario seed,
-both from the environment's seeded generator, so ``reset(seed=s)`` followed by
-the same actions always replays the same episode.
+Each reset picks one of the load levels at random and a scenario seed from
+``scenario_seeds``, both from the environment's seeded generator, so
+``reset(seed=s)`` followed by the same actions always replays the same
+episode. Training and evaluation draw scenario seeds from disjoint ranges, so
+an agent is evaluated on traffic and channels it never trained on; the reset
+options ``level`` and ``scenario_seed`` pin both for evaluation.
 """
 
 from __future__ import annotations
@@ -101,9 +104,11 @@ class SliceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
         decision_slots: int = 10,
         episode_s: float = 1.0,
         reward: RewardConfig | None = None,
+        scenario_seeds: tuple[int, int] = (0, 2**31),
     ) -> None:
         """``levels`` are the scenarios an episode is drawn from, typically one per
-        load level; they must have the same slices in the same order."""
+        load level; they must have the same slices in the same order. Scenario
+        seeds are drawn from the half-open range ``scenario_seeds``."""
         super().__init__()
         if not levels:
             raise ValueError("give at least one scenario")
@@ -121,6 +126,9 @@ class SliceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
             raise ValueError("decision_slots must be at least 1")
         if not episode_s > 0:
             raise ValueError("episode_s must be positive")
+        if not 0 <= scenario_seeds[0] < scenario_seeds[1] <= 2**63:
+            raise ValueError("scenario_seeds must be a non-empty range of non-negative seeds")
+        self.scenario_seeds = scenario_seeds
         self.levels = list(levels)
         self.decision_slots = decision_slots
         self.episode_s = episode_s
@@ -155,7 +163,10 @@ class SliceEnv(gym.Env[npt.NDArray[np.float32], npt.NDArray[np.float32]]):
                 raise ValueError(f"level must be 0 to {len(self.levels) - 1}")
         else:
             self.level = int(rng.integers(len(self.levels)))
-        scenario_seed = int(rng.integers(2**31))
+        if options and "scenario_seed" in options:
+            scenario_seed = int(options["scenario_seed"])
+        else:
+            scenario_seed = int(rng.integers(*self.scenario_seeds))
         scenario = self.levels[self.level].replace(seed=scenario_seed, duration_s=self.episode_s)
         self.sim = Simulation(scenario)
         self.sim.policy = self._policy

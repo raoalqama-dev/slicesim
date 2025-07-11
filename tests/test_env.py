@@ -225,6 +225,7 @@ def unsliced() -> Scenario:
         ({"levels": [unsliced()]}, "is not sliced"),
         ({"decision_slots": 0}, "decision_slots"),
         ({"episode_s": 0.0}, "episode_s"),
+        ({"scenario_seeds": (5, 5)}, "scenario_seeds"),
         (
             {"reward": RewardConfig(satisfaction={"embb": 1.0}, penalty={})},
             "reward weights missing for mmtc, urllc",

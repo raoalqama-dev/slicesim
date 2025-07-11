@@ -32,6 +32,7 @@ dependencies = [
 [project.optional-dependencies]
 rl = [
     "gymnasium>=1.0",
+    "torch>=2.5.1",
 ]
 dev = [
     "mypy>=1.11",
@@ -52,7 +53,7 @@ Changelog = "https://github.com/raoalqama-dev/slicesim/blob/main/CHANGELOG.md"
 path = "src/slicesim/__init__.py"
 
 [tool.hatch.build.targets.sdist]
-include = ["src", "tests", "scenarios", "README.md"]
+include = ["src", "tests", "scenarios", "models", "README.md"]
 
 [tool.ruff]
 line-length = 100

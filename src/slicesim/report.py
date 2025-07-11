@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Protocol
 
 from slicesim.config import (
     AdaptiveLink,
@@ -278,3 +279,81 @@ def render_comparison(runs: Sequence[tuple[Scenario, RunSummary]]) -> str:
     )
     table = format_table(headers, rows, "l" + "r" * 10)
     return "\n".join([*header, "", table, "", legend])
+
+
+POLICY_LABELS = {
+    "ppo": "PPO agent",
+    "equal_weights": "equal weights",
+    "static": "static quotas",
+    "proportional": "proportional",
+    "delay_aware": "delay-aware",
+}
+
+
+class _EvaluationTotals(Protocol):
+    """What render_evaluation reads from each row (slicesim.rl.evaluate.PolicyTotals)."""
+
+    @property
+    def level(self) -> str: ...
+
+    @property
+    def policy(self) -> str: ...
+
+    @property
+    def seeds(self) -> int: ...
+
+    @property
+    def cell_mbps(self) -> float: ...
+
+    @property
+    def embb_short(self) -> float: ...
+
+    @property
+    def embb_met(self) -> int: ...
+
+    @property
+    def urllc_violations(self) -> float: ...
+
+    @property
+    def urllc_met(self) -> int: ...
+
+    @property
+    def mmtc_violations(self) -> float: ...
+
+    @property
+    def mmtc_met(self) -> int: ...
+
+
+def render_evaluation(totals: Sequence[_EvaluationTotals]) -> str:
+    """The table ``slicesim evaluate`` prints: one row per level and policy."""
+    headers = [
+        "level",
+        "policy",
+        "cell Mb/s",
+        "eMBB short",
+        "met",
+        "URLLC late",
+        "met",
+        "mMTC late",
+        "met",
+    ]
+    rows = [
+        [
+            t.level,
+            POLICY_LABELS.get(t.policy, t.policy),
+            _number(t.cell_mbps),
+            f"{t.embb_short:.2%}",
+            f"{t.embb_met}/{t.seeds}",
+            f"{t.urllc_violations:.3%}",
+            f"{t.urllc_met}/{t.seeds}",
+            f"{t.mmtc_violations:.2%}",
+            f"{t.mmtc_met}/{t.seeds}",
+        ]
+        for t in totals
+    ]
+    legend = (
+        "Means over held-out seeds; met counts the seeds on which the slice met its SLA. "
+        "eMBB short is the share of UE-windows below the minimum rate; URLLC and mMTC late "
+        "is the share of packets late, lost or overdue."
+    )
+    return "\n".join([format_table(headers, rows, "ll" + "r" * 7), "", legend])

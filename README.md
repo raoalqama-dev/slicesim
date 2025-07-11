@@ -17,8 +17,11 @@ HARQ. Round robin, max C/I and proportional fair schedulers share the PRBs, and
 `slicesim compare` runs a scenario under each of them. The cell can be split
 into eMBB, URLLC and mMTC slices, each with its own SLA and scheduler, under a
 static, delay-aware or demand-proportional policy, with SLA accounting per
-slice. A Gymnasium environment lets an agent take the policy's place; the PPO
-agent that learns in it is next on the [roadmap](#roadmap).
+slice. A Gymnasium environment lets an agent take the policy's place, and a
+PPO agent written from scratch in PyTorch learns in it (`slicesim train`) and
+is compared with the heuristic policies on held-out seeds (`slicesim
+evaluate`). Experiments, figures and a dashboard are next on the
+[roadmap](#roadmap).
 
 ## Quick start
 
@@ -186,8 +189,9 @@ so the policies, not the margin, decide the outcome.
 ## Reinforcement learning environment
 
 `pip install -e ".[rl]"` adds a [Gymnasium](https://gymnasium.farama.org)
-environment in which an agent replaces the inter-slice policy and decides, every
-decision interval, how the cell is shared between slices:
+environment, and PyTorch for the agent, in which an agent replaces the
+inter-slice policy and decides, every decision interval, how the cell is shared
+between slices:
 
 ```python
 import gymnasium as gym
@@ -246,6 +250,78 @@ Because a slice passes on what it cannot use, equal weights already serve the
 small URLLC slice almost at once, and its remaining violations come from HARQ
 retransmissions, not from the split. Weighting eMBB up instead starves URLLC,
 and the reward shows it.
+
+## Training and evaluating the agent
+
+```sh
+slicesim train scenarios/low.yaml scenarios/medium.yaml scenarios/high.yaml --out runs/ppo
+slicesim evaluate runs/ppo/agent.pt scenarios/low.yaml scenarios/medium.yaml scenarios/high.yaml --seeds 3 --workers 4
+```
+
+`slicesim train` trains on the given load levels, one drawn per episode, for
+60,000 decisions by default (`--steps`), seeded by `--seed`. It writes
+`log.csv` (one row per update: steps, episodes, mean return, losses, entropy,
+KL, clip fraction, action spread and time), a checkpoint every five updates and
+the final `agent.pt`. The default run takes about 11 minutes on a laptop CPU, and
+the same seed gives the same weights and the same log. The agent it produced is
+committed as `models/ppo-slicing.pt` (48 KB), with its training log beside it.
+
+The agent is PPO written from scratch in PyTorch (`slicesim/rl/ppo.py`):
+
+- separate actor and critic networks, two hidden layers of 64 with tanh;
+- a diagonal Gaussian policy over the slice logits, with a learned,
+  state-independent standard deviation;
+- generalized advantage estimation with gamma 0.99 and lambda 0.95,
+  bootstrapping from the critic where an episode was cut off by its time limit;
+- the clipped surrogate objective (epsilon 0.2), a value loss clipped the same
+  way, and an entropy bonus;
+- observations normalized by running mean and variance, advantages normalized
+  per minibatch, gradients clipped to norm 0.5;
+- rollouts of 2,048 steps, 10 epochs of minibatches of 128, Adam at 3e-4.
+
+`slicesim evaluate` runs the agent (acting on its policy's mean), equal weights
+and the three heuristic policies on every load level with the same held-out
+seeds, which training never draws from, so every policy sees the same UEs,
+channels and traffic. With the committed agent, three seeds, 10 s each:
+
+| Load | Policy | eMBB windows short | eMBB SLA met | URLLC late or lost | URLLC SLA met | mMTC late or lost |
+| ---- | ------ | -----------------: | -----------: | -----------------: | ------------: | ----------------: |
+| low | PPO agent | 0.29% | 3/3 | 0.092% | 2/3 | 0.07% |
+| low | equal weights | 0.29% | 3/3 | 0.092% | 2/3 | 0.03% |
+| low | static quotas | 0.27% | 3/3 | 0.312% | 1/3 | 0.03% |
+| low | proportional | 0.22% | 3/3 | 0.210% | 2/3 | 0.03% |
+| low | delay-aware | 0.29% | 3/3 | 0.083% | 2/3 | 0.03% |
+| medium | PPO agent | 0.50% | 3/3 | 0.097% | 2/3 | 0.07% |
+| medium | equal weights | 0.44% | 3/3 | 0.095% | 2/3 | 0.03% |
+| medium | static quotas | 0.63% | 3/3 | 0.297% | 1/3 | 0.03% |
+| medium | proportional | 0.49% | 3/3 | 0.298% | 1/3 | 0.03% |
+| medium | delay-aware | 0.47% | 3/3 | 0.102% | 2/3 | 0.03% |
+| high | PPO agent | 2.82% | 2/3 | 0.098% | 2/3 | 0.03% |
+| high | equal weights | 2.83% | 2/3 | 0.098% | 2/3 | 0.03% |
+| high | static quotas | 7.98% | 1/3 | 0.327% | 1/3 | 0.03% |
+| high | proportional | 2.83% | 2/3 | 0.433% | 0/3 | 0.03% |
+| high | delay-aware | 2.83% | 2/3 | 0.097% | 2/3 | 0.03% |
+
+What this does and does not show:
+
+- **The agent beats static quotas and proportional sharing on URLLC** at every
+  load, with two to four times fewer violations, and static quotas on eMBB at
+  high load. A test pins the medium-load case on a held-out seed.
+- **It does not beat equal weights or the delay-aware policy.** It learned to
+  stay close to equal weights: its mean episode return rose from 423 over the
+  first five updates to 456 over the last five, with exploration noise on, while
+  equal weights score 462 without it. In this environment equal weights are
+  already hard to beat. Unused shares pass on, URLLC needs little, and the URLLC
+  violations that remain come from HARQ retransmissions after deep fades, which
+  no split prevents.
+- **It is slightly worse on mMTC** at low and medium load (0.07% against 0.03%),
+  a handful of sensor packets out of several thousand; the reward weights mMTC
+  lowest.
+- **URLLC meets its 99.9% target on two of three seeds** under every good
+  policy. The third misses it at every load; at medium load, one URLLC UE with
+  a mean SINR of 16.7 dB accounts for 52 of its 57 violations even under the
+  delay-aware policy, which already serves URLLC first: its fades, not the
+  split, are the limit.
 
 ## Scenarios
 
@@ -460,19 +536,20 @@ periods last five frames on average.
 - [x] MAC schedulers: round robin, max C/I, proportional fair; `slicesim compare`
 - [x] Network slicing with per-slice SLAs and inter-slice policies
 - [x] Gymnasium environment for the slice controller
-- [ ] PPO agent written from scratch; `slicesim train` and `slicesim evaluate`
+- [x] PPO agent written from scratch; `slicesim train` and `slicesim evaluate`
 - [ ] Experiments, figures, dashboard and v0.1.0
 
 ## Development
 
 ```sh
+pip install torch --index-url https://download.pytorch.org/whl/cpu   # optional: CPU-only PyTorch
 pip install -e ".[dev,rl]"
 ruff check . && ruff format --check .   # lint and formatting
 mypy                                    # strict type checking of src and tests
 pytest --cov                            # tests, with a 90% coverage floor
 ```
 
-Without the `rl` extra the environment's tests are skipped. CI runs the same
+Without the `rl` extra the environment's and agent's tests are skipped. CI runs the same
 checks, the tests on Python 3.11 to 3.14 without the extra, all of them with
 coverage in a job that installs it, and the tests again against the oldest
 dependency versions `pyproject.toml` allows.
