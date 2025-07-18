@@ -22,7 +22,7 @@ import torch
 from slicesim.compare import with_policy
 from slicesim.config import Scenario
 from slicesim.engine import simulate
-from slicesim.metrics import RunSummary
+from slicesim.metrics import RunSummary, SimulationResult
 from slicesim.rl.env import SliceEnv
 from slicesim.rl.ppo import PPO
 from slicesim.rl.train import TRAINING_SEEDS
@@ -72,6 +72,13 @@ def _row(level: str, policy: str, seed: int, summary: RunSummary) -> EvaluationR
 
 def run_agent(agent: PPO | None, scenario: Scenario, decision_slots: int) -> RunSummary:
     """Run ``scenario`` with the agent choosing the split, or equal weights if None."""
+    return run_agent_result(agent, scenario, decision_slots).summary()
+
+
+def run_agent_result(
+    agent: PPO | None, scenario: Scenario, decision_slots: int
+) -> SimulationResult:
+    """Like ``run_agent``, returning the full result rather than its summary."""
     env = SliceEnv(
         [scenario],
         decision_slots=decision_slots,
@@ -86,7 +93,7 @@ def run_agent(agent: PPO | None, scenario: Scenario, decision_slots: int) -> Run
         obs, _, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
     assert env.sim is not None
-    return env.sim.result().summary()
+    return env.sim.result()
 
 
 @dataclass(frozen=True)

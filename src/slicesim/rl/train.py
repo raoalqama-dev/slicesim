@@ -10,11 +10,12 @@ from pathlib import Path
 import torch
 
 from slicesim.config import Scenario
+from slicesim.experiments.runner import HELD_OUT_SEEDS
 from slicesim.rl.env import SliceEnv
 from slicesim.rl.ppo import PPO, PPOConfig, UpdateStats
 
-TRAINING_SEEDS = (0, 1_000_000)
-"""Scenario seeds training draws from; evaluation uses seeds above this range."""
+TRAINING_SEEDS = (0, HELD_OUT_SEEDS)
+"""Scenario seeds training draws from; evaluation and experiments use seeds above."""
 
 LOG_FIELDS = [f.name for f in fields(UpdateStats)]
 

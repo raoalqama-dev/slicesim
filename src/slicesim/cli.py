@@ -13,6 +13,7 @@ from slicesim import __version__
 from slicesim.compare import SCHEDULERS, compare_schedulers, with_policy
 from slicesim.config import Scenario, ScenarioError, load_scenario
 from slicesim.engine import simulate
+from slicesim.experiments.runner import HELD_OUT_SEEDS
 from slicesim.report import render_comparison, render_evaluation, render_summary
 from slicesim.slicing import POLICIES
 
@@ -49,6 +50,22 @@ def _positive_int(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return value
+
+
+def _policies(text: str) -> list[str]:
+    from slicesim.experiments.runner import POLICIES
+
+    names = [name.strip() for name in text.split(",") if name.strip()]
+    unknown = [name for name in names if name not in POLICIES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown policy {unknown[0]!r}; choose from {', '.join(POLICIES)}"
+        )
+    if not names:
+        raise argparse.ArgumentTypeError("name at least one policy")
+    if len(set(names)) != len(names):
+        raise argparse.ArgumentTypeError("each policy may be named once")
+    return names
 
 
 def _schedulers(text: str) -> list[str]:
@@ -148,6 +165,45 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--workers", type=_positive_int, default=1, help="parallel runs")
     evaluate.add_argument("--csv", metavar="PATH", help="also write every run to a CSV file")
     evaluate.add_argument("--json", action="store_true", help="print the results as JSON")
+
+    experiment = commands.add_parser(
+        "experiment",
+        help="sweep load levels, policies and seeds into CSV files",
+        description=(
+            "Run every scenario under every policy with every seed, and write runs.csv "
+            "(one row per slice and run) and delays.csv (delay quantiles) to --out. "
+            "equal_weights and ppo need the rl extra."
+        ),
+    )
+    experiment.add_argument("levels", nargs="+", metavar="SCENARIO", help="sliced scenarios")
+    experiment.add_argument(
+        "--policies",
+        type=_policies,
+        default=["static", "proportional", "delay_aware"],
+        metavar="NAMES",
+        help="comma-separated policies (default: static,proportional,delay_aware)",
+    )
+    experiment.add_argument("--checkpoint", help="agent checkpoint, for the ppo policy")
+    experiment.add_argument("--seeds", type=_positive_int, default=3, help="number of seeds")
+    experiment.add_argument(
+        "--first-seed",
+        type=_seed,
+        default=HELD_OUT_SEEDS,
+        help=f"the first seed (default: {HELD_OUT_SEEDS:,}, above every seed training uses)",
+    )
+    experiment.add_argument(
+        "--duration", type=_duration, metavar="SECONDS", help="override the run length"
+    )
+    experiment.add_argument("--workers", type=_positive_int, default=1, help="parallel runs")
+    experiment.add_argument("--out", default="results", help="output directory")
+
+    plot = commands.add_parser(
+        "plot",
+        help="draw figures from an experiment's results (needs the plots extra)",
+        description="Draw the SLA, delay and throughput figures from runs.csv and delays.csv.",
+    )
+    plot.add_argument("results", help="directory holding runs.csv and delays.csv")
+    plot.add_argument("--out", default="docs/figures", help="where to write the PNG files")
     return parser
 
 
@@ -197,7 +253,11 @@ def _compare(args: argparse.Namespace, out: TextIO) -> int:
 
 
 class MissingExtraError(Exception):
-    """A command needs the rl extra, which is not installed."""
+    """A command needs an optional extra that is not installed."""
+
+    def __init__(self, reason: str, extra: str = "rl") -> None:
+        super().__init__(reason)
+        self.extra = extra
 
 
 class CommandError(Exception):
@@ -268,7 +328,51 @@ def _evaluate(args: argparse.Namespace, out: TextIO) -> int:
     return EXIT_OK
 
 
-COMMANDS = {"run": _run, "compare": _compare, "train": _train, "evaluate": _evaluate}
+def _experiment(args: argparse.Namespace, out: TextIO) -> int:
+    from slicesim.experiments.runner import LEARNED, run_experiment, write_results
+
+    levels = _load_levels(args.levels)
+    try:
+        result = run_experiment(
+            levels,
+            args.policies,
+            seeds=range(args.first_seed, args.first_seed + args.seeds),
+            duration_s=args.duration,
+            checkpoint=args.checkpoint,
+            workers=args.workers,
+        )
+    except ImportError as exc:
+        learned = ", ".join(p for p in args.policies if p in LEARNED)
+        raise MissingExtraError(f"{learned}: {exc}") from None
+    except (OSError, ValueError) as exc:
+        raise CommandError(str(exc)) from None
+    runs, delays = write_results(result, args.out)
+    out.write(f"wrote {runs} and {delays} ({len(result.slices)} slice rows)\n")
+    return EXIT_OK
+
+
+def _plot(args: argparse.Namespace, out: TextIO) -> int:
+    try:
+        from slicesim.experiments.plots import make_figures
+    except ImportError as exc:
+        raise MissingExtraError(str(exc), "plots") from None
+    try:
+        paths = make_figures(args.results, args.out)
+    except (OSError, ValueError, KeyError) as exc:
+        raise CommandError(str(exc)) from None
+    for path in paths:
+        out.write(f"wrote {path}\n")
+    return EXIT_OK
+
+
+COMMANDS = {
+    "run": _run,
+    "compare": _compare,
+    "train": _train,
+    "evaluate": _evaluate,
+    "experiment": _experiment,
+    "plot": _plot,
+}
 
 
 def main(
@@ -284,8 +388,8 @@ def main(
         return EXIT_USAGE
     except MissingExtraError as exc:
         err.write(
-            f"slicesim: {args.command} needs the rl extra ({exc}); "
-            'install it with: pip install "slicesim[rl]"\n'
+            f"slicesim: {args.command} needs the {exc.extra} extra ({exc}); "
+            f'install it with: pip install "slicesim[{exc.extra}]"\n'
         )
         return EXIT_USAGE
     except CommandError as exc:

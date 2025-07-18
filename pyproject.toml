@@ -34,6 +34,12 @@ rl = [
     "gymnasium>=1.0",
     "torch>=2.5.1",
 ]
+plots = [
+    "matplotlib>=3.10.7",
+]
+dashboard = [
+    "streamlit>=1.50",
+]
 dev = [
     "mypy>=1.11",
     "pytest>=8.0",
@@ -79,7 +85,7 @@ select = [
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests"]
+files = ["src", "tests", "dashboard"]
 plugins = ["pydantic.mypy"]
 
 [tool.pydantic-mypy]

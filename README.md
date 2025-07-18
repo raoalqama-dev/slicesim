@@ -9,19 +9,46 @@ SLAs better than classic MAC schedulers and fixed slicing policies. Every run is
 seeded, scenarios are validated YAML files, and the radio models cite the 3GPP
 specifications they implement.
 
-**Status:** early development. A cell sized from TS 38.101-1 serves UEs dropped
-over a TR 38.901 urban macro cell, with path loss, shadowing and Rayleigh block
-fading. Transport blocks are sized from the CQI each UE reports (TS 38.214),
-fail with a BLER that depends on the SINR they meet, and are retransmitted by
-HARQ. Round robin, max C/I and proportional fair schedulers share the PRBs, and
-`slicesim compare` runs a scenario under each of them. The cell can be split
-into eMBB, URLLC and mMTC slices, each with its own SLA and scheduler, under a
-static, delay-aware or demand-proportional policy, with SLA accounting per
-slice. A Gymnasium environment lets an agent take the policy's place, and a
-PPO agent written from scratch in PyTorch learns in it (`slicesim train`) and
-is compared with the heuristic policies on held-out seeds (`slicesim
-evaluate`). Experiments, figures and a dashboard are next on the
-[roadmap](#roadmap).
+**Status:** v0.1.0. See the [results](#results) and the
+[changelog](CHANGELOG.md).
+
+- **The cell.** A carrier sized from TS 38.101-1 serves UEs dropped over a
+  TR 38.901 urban macro cell, with path loss, shadowing and Rayleigh block
+  fading.
+- **The link.** Transport blocks are sized from the CQI each UE reports
+  (TS 38.214), fail with a BLER that depends on the SINR they meet, and are
+  retransmitted by HARQ.
+- **Scheduling.** Round robin, max C/I and proportional fair schedulers
+  share the PRBs.
+- **Slicing.** The cell can be split into eMBB, URLLC and mMTC slices, each
+  with its own SLA and scheduler, under a static, delay-aware or
+  demand-proportional policy, or under a PPO agent written from scratch in
+  PyTorch and trained in a Gymnasium environment.
+- **Experiments.** `slicesim experiment` sweeps loads, policies and seeds;
+  `slicesim plot` draws the figures; a Streamlit dashboard builds and runs
+  scenarios interactively.
+
+```mermaid
+flowchart TD
+    yaml["scenario YAML"] --> config["config: validated scenario"]
+    config --> engine["engine: the slot loop"]
+    traffic["traffic: full buffer, Poisson, periodic, on/off"] --> engine
+    channel["channel: UMa path loss, shadowing, block fading"] --> link["link: CQI, bits per PRB, BLER"]
+    link --> engine
+    engine --> harq["HARQ: retransmissions, in-order delivery"]
+    engine --> policy{"inter-slice policy"}
+    policy -->|"static, proportional, delay-aware"| schedulers["schedulers per slice: RR, max C/I, PF"]
+    agent["PPO agent, through the Gymnasium environment"] -.->|"replaces"| policy
+    engine --> metrics["metrics and SLA accounting"]
+    metrics --> commands["run, compare, evaluate, experiment"]
+    commands --> outputs["tables, CSV, figures, dashboard"]
+```
+
+Each slot, the engine reads every UE's SINR from the channel and sizes blocks
+from the CQI reported a couple of slots earlier. HARQ retransmissions go first.
+The inter-slice policy, or the agent, splits the remaining PRBs between slices,
+and each slice's scheduler shares its part. Blocks decode or fail at the SINR
+they meet, and the metrics record every packet's fate against its slice's SLA.
 
 ## Quick start
 
@@ -323,6 +350,112 @@ What this does and does not show:
   delay-aware policy, which already serves URLLC first: its fades, not the
   split, are the limit.
 
+## Results
+
+`slicesim experiment` runs every load level under every policy with several
+seeds, and writes `runs.csv` (a row per slice and run) and `delays.csv` (each
+slice's delay quantiles); `slicesim plot` draws the figures from them. The
+results below come from these commands, committed in `docs/results/` and
+`docs/figures/`:
+
+```sh
+slicesim experiment scenarios/low.yaml scenarios/medium.yaml scenarios/high.yaml \
+    --policies static,proportional,delay_aware,equal_weights,ppo \
+    --checkpoint models/ppo-slicing.pt --seeds 5 --workers 4 --out docs/results
+slicesim plot docs/results --out docs/figures
+```
+
+Five held-out seeds (1,000,000 to 1,000,004, which training never drew), 10 s
+each, so every policy sees the same UEs, channels and traffic: 75 runs in about
+six minutes on four cores. Means over the seeds, with the number of seeds on
+which the slice met its SLA:
+
+| Load | Policy | URLLC late or lost | URLLC met | eMBB windows short | eMBB met | mMTC late or lost |
+| ---- | ------ | -----------------: | --------: | -----------------: | -------: | ----------------: |
+| low | static quotas | 0.576% | 1/5 | 0.37% | 5/5 | 0.02% |
+| low | proportional | 0.372% | 2/5 | 0.30% | 5/5 | 0.02% |
+| low | delay-aware | 0.197% | 2/5 | 0.38% | 5/5 | 0.02% |
+| low | equal weights | 0.211% | 2/5 | 0.38% | 5/5 | 0.02% |
+| low | PPO agent | 0.215% | 2/5 | 0.34% | 5/5 | 0.04% |
+| medium | static quotas | 0.572% | 1/5 | 0.46% | 5/5 | 0.02% |
+| medium | proportional | 0.555% | 1/5 | 0.35% | 5/5 | 0.02% |
+| medium | delay-aware | 0.224% | 2/5 | 0.33% | 5/5 | 0.02% |
+| medium | equal weights | 0.214% | 2/5 | 0.33% | 5/5 | 0.02% |
+| medium | PPO agent | 0.220% | 2/5 | 0.35% | 5/5 | 0.04% |
+| high | static quotas | 0.633% | 1/5 | 6.25% | 2/5 | 0.02% |
+| high | proportional | 0.777% | 0/5 | 2.11% | 4/5 | 0.02% |
+| high | delay-aware | 0.218% | 2/5 | 2.12% | 4/5 | 0.02% |
+| high | equal weights | 0.222% | 2/5 | 2.09% | 4/5 | 0.02% |
+| high | PPO agent | 0.236% | 2/5 | 2.11% | 4/5 | 0.02% |
+
+![URLLC and eMBB SLA violations against load](docs/figures/sla_vs_load.png)
+
+![URLLC delay distribution at medium load](docs/figures/delay_cdf.png)
+
+![Throughput per slice](docs/figures/throughput_per_slice.png)
+
+What the experiment shows:
+
+- **Static quotas are the worst policy for URLLC at low and medium load**, with
+  close to three times the violations of the best policies, and they cost eMBB
+  three times as many short windows at high load (6.25% against about 2.1%),
+  because PRBs reserved for the other slices sit idle while video is short.
+  They are also the only policy that delivers less in total at high load
+  (50.7 against 51.3 Mbit/s).
+- **Proportional sharing gets worse for URLLC as video grows** (0.37%, 0.56%,
+  0.78%): bursts of video take bursts of PRBs. At high load it is the worst
+  policy for URLLC, missing the SLA on every seed.
+- **Delay-aware, equal weights and the PPO agent are indistinguishable.** Their
+  URLLC violations differ by less than the spread between seeds, and so do
+  their eMBB results. The delay distribution shows the same: the three curves
+  lie on one another, and static quotas and proportional sharing have the
+  heavier tail past 5 ms.
+- **Where the agent loses.** It never beats equal weights, the action an
+  untrained agent starts near, on URLLC (0.215%, 0.220%, 0.236% against
+  0.211%, 0.214%, 0.222%), and it doubles mMTC's violations at low and medium
+  load (0.04% against 0.02%): one late sensor packet on two seeds instead of
+  one, out of about 1,000 per run. Training moved
+  its return from 423 to 456 per episode while exploring, which is learning to
+  avoid bad splits, not finding a better one. In this cell there is little to
+  find: unused shares pass on, URLLC needs about 6% of the PRBs, and a policy
+  only has to not starve it.
+- **No policy meets the URLLC SLA on three of the five seeds**, at any load.
+  On each of those seeds one or two UEs cause almost every violation even under
+  the delay-aware policy, which already serves URLLC first: at medium load, one
+  UE accounts for 52 of 57 violations on seed 1,000,000, two UEs for 96 of 104
+  on seed 1,000,003, and one UE for all 59 on seed 1,000,004. They fade deeply
+  for a whole coherence time, their blocks fail, and HARQ cannot recover within
+  5 ms. Meeting 99.9% for them takes a radio fix (more receive branches, a
+  conservative CQI back-off, or shorter slots), not a better split; see
+  [Network slicing](#network-slicing).
+- **Throughput does not separate the policies.** At low and medium load all of
+  them deliver everything offered; the slices differ in when, not how much.
+
+So in this setting a learned slice controller is not worth its cost. The
+heuristic that serves the tightest delay budget first does as well, and the
+remaining violations are in the radio, not in the split. A case for learning
+would need a cell where simple policies fail: URLLC traffic heavy enough to
+compete for PRBs, eMBB minimums near capacity, or an observation that sees each
+UE's channel, so the controller can act on the fades that cause the violations.
+
+## Dashboard
+
+```sh
+pip install -e ".[dashboard]"
+streamlit run dashboard/app.py
+```
+
+The dashboard builds a three-slice scenario like `scenarios/medium.yaml` from
+the sidebar: the carrier and cell, receive antennas, how many video, URLLC and
+sensor UEs, the URLLC packet size and period, the slicing policy (with quotas
+for static slicing), the run length and the seed. It shows the scenario's YAML,
+ready to download, and after a run:
+
+- the cell's throughput, PRB use, BLER and SLAs met;
+- each slice against its SLA;
+- PRB shares and throughput per slice over time;
+- the URLLC delay distribution.
+
 ## Scenarios
 
 A scenario is a YAML file describing one run completely. Everything but the
@@ -537,19 +670,20 @@ periods last five frames on average.
 - [x] Network slicing with per-slice SLAs and inter-slice policies
 - [x] Gymnasium environment for the slice controller
 - [x] PPO agent written from scratch; `slicesim train` and `slicesim evaluate`
-- [ ] Experiments, figures, dashboard and v0.1.0
+- [x] Experiments, figures, dashboard and v0.1.0
 
 ## Development
 
 ```sh
 pip install torch --index-url https://download.pytorch.org/whl/cpu   # optional: CPU-only PyTorch
-pip install -e ".[dev,rl]"
+pip install -e ".[dev,rl,plots,dashboard]"
 ruff check . && ruff format --check .   # lint and formatting
 mypy                                    # strict type checking of src and tests
 pytest --cov                            # tests, with a 90% coverage floor
 ```
 
-Without the `rl` extra the environment's and agent's tests are skipped. CI runs the same
-checks, the tests on Python 3.11 to 3.14 without the extra, all of them with
-coverage in a job that installs it, and the tests again against the oldest
-dependency versions `pyproject.toml` allows.
+The extras are `rl` (gymnasium and PyTorch), `plots` (matplotlib) and
+`dashboard` (Streamlit); without one, its tests are skipped. CI runs the same
+checks, the tests on Python 3.11 to 3.14 without the extras, all of them with
+coverage in a job that installs every extra, and the tests again against the
+oldest dependency versions `pyproject.toml` allows.

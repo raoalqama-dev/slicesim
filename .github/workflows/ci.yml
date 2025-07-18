@@ -24,7 +24,7 @@ jobs:
           cache: pip
       # The CPU build of PyTorch is a fraction of the size of the default one.
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: python -m pip install -e ".[dev,rl]"
+      - run: python -m pip install -e ".[dev,rl,plots,dashboard]"
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
@@ -42,13 +42,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      # Without the [rl] extra the environment's tests skip; coverage is measured
-      # in the rl job, which runs everything.
+      # Without the extras their tests skip; coverage is measured in the extras
+      # job, which runs everything.
       - run: python -m pip install -e ".[dev]"
       - run: pytest
 
-  rl:
-    name: Tests with the [rl] extra, and coverage
+  extras:
+    name: Tests with every extra, and coverage
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -57,7 +57,7 @@ jobs:
           python-version: "3.13"
           cache: pip
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-      - run: python -m pip install -e ".[dev,rl]"
+      - run: python -m pip install -e ".[dev,rl,plots,dashboard]"
       - run: pytest --cov --cov-report=term-missing
 
   minimum-versions:
